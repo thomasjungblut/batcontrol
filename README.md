@@ -48,6 +48,13 @@ uv venv --python 3.14 && uv pip install -e '.[test]'
 python -m batcontrol --config config/batcontrol_config.yaml [--one-shot]
 ```
 
+To build with podman and push to the local registry (tagged with the short commit SHA
+and `latest`; `NO_PUSH=1` builds only):
+
+```bash
+scripts/build-and-push.sh
+```
+
 The image is `python:3.14-slim` (Debian). On first start with an empty `./config` it
 copies a template config and exits; fill it in and start again. Set `TZ` in
 `compose.yaml` and make the published port match `api.port`. `docker stop` sends

@@ -27,6 +27,7 @@ src/batcontrol/
   __main__.py       # CLI + 3-minute loop; core.wakeup cuts the sleep short
 config/batcontrol_config_dummy.yaml   # every parameter; first-run template for Docker
 tests/              # pytest, mirrors the package
+scripts/build-and-push.sh  # podman build + push to 192.168.178.63:32768, tagged with the commit SHA
 ```
 
 ## Rules of the road
