@@ -16,7 +16,7 @@ Behaviour:
   Successful mode commands supersede earlier failed mode commands.
 - If failures persist past the tolerance window, they are escalated to
   InverterOutageError, which terminates batcontrol.
-- shutdown() is best-effort: they never abort a cycle.
+- shutdown() and read_status() are best-effort: they never abort a cycle.
 """
 
 import time
@@ -38,7 +38,7 @@ _COMMAND_METHODS = frozenset({
 })
 
 # Best-effort methods never abort a control cycle - just log and move on.
-_BEST_EFFORT_METHODS = frozenset({'shutdown'})
+_BEST_EFFORT_METHODS = frozenset({'shutdown', 'read_status'})
 
 
 def _remaining_failures(failed_methods, successful_method):

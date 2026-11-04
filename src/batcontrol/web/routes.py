@@ -14,7 +14,8 @@ from fastapi.responses import JSONResponse
 from .. import __pkginfo__
 from .. import rules
 from .models import (
-    BatteryModel, ChargeModel, Envelope, Health, ManualChargeModel,
+    BatteryModel, ChargeModel, Envelope, Health, InverterModel,
+    InverterRuleModel, ManualChargeModel,
     ManualChargeRequest, PlanModel, PriceSlotModel, StatusModel,
 )
 
@@ -67,6 +68,27 @@ def _charge(charge: rules.Charge, now: datetime.datetime) -> ChargeModel:
     )
 
 
+def _rounded(value):
+    return None if value is None else round(value)
+
+
+def _inverter(status) -> Optional[InverterModel]:
+    if status is None:
+        return None
+    return InverterModel(
+        read_at=ms(status.read_at),
+        rules=[InverterRuleModel(schedule_type=r.schedule_type, power_w=r.power_w,
+                                 start=r.start, end=r.end, active=r.active)
+               for r in status.rules],
+        battery_mode=status.battery_mode,
+        battery_standby=status.battery_standby,
+        battery_power_w=_rounded(status.battery_power_w),
+        grid_power_w=_rounded(status.grid_power_w),
+        load_power_w=_rounded(status.load_power_w),
+        pv_power_w=_rounded(status.pv_power_w),
+    )
+
+
 def _charge_reason(slot: rules.Slot, plan: rules.Plan) -> Optional[str]:
     for charge in plan.charges:
         if charge.start <= slot.start < charge.end:
@@ -103,6 +125,8 @@ def build_status(bc) -> StatusModel:
             min_soc=battery.min_soc,
             max_soc=battery.max_soc,
         ),
+        inverter=_inverter(result.inverter),
+        inverter_check=result.inverter_check,
         plan=PlanModel(
             night_start=ms(plan.night_start),
             night_end=ms(plan.night_end),

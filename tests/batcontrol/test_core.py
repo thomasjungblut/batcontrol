@@ -105,3 +105,67 @@ def test_an_unreachable_inverter_skips_the_cycle(bc):
     assert bc.run() is None
     assert bc.last is None
     bc.inverter.set_mode_allow_discharge.assert_not_called()
+
+
+# -- comparing the inverter with the plan --------------------------------------
+
+import datetime  # noqa: E402
+
+import pytz  # noqa: E402
+
+from batcontrol.core import check_inverter  # noqa: E402
+from batcontrol.inverter.status import InverterRule, InverterStatus  # noqa: E402
+
+TZ = pytz.timezone('Europe/Berlin')
+SETTINGS = rules.Settings(max_charge_rate_w=3800)
+CHARGE = InverterRule('CHARGE_MIN', 3800, '00:00', '23:59', True)
+
+
+def charge_plan():
+    now = TZ.localize(datetime.datetime(2026, 11, 4, 12))
+    return rules.plan(now, [], rules.Battery(50, 10000, 5, 100), SETTINGS,
+                      manual_until=now + datetime.timedelta(hours=1))
+
+
+def normal_plan():
+    now = TZ.localize(datetime.datetime(2026, 11, 4, 12))
+    return rules.plan(now, [], rules.Battery(50, 10000, 5, 100), SETTINGS)
+
+
+def status(*rule_list, battery=3500.0, standby=False):
+    return InverterStatus(read_at=0, rules=rule_list, battery_power_w=battery,
+                          battery_standby=standby)
+
+
+def test_check_agrees_when_charging_at_full_power():
+    assert check_inverter(charge_plan(), status(CHARGE)) is None
+
+
+def test_check_reports_a_missing_rule():
+    assert 'no active CHARGE_MIN' in check_inverter(charge_plan(), status())
+    off = InverterRule('CHARGE_MIN', 3800, '00:00', '23:59', False)
+    assert 'no active CHARGE_MIN' in check_inverter(charge_plan(), status(off))
+
+
+def test_check_reports_ramping_up_from_standby():
+    text = check_inverter(charge_plan(), status(CHARGE, battery=750, standby=True))
+    assert text == 'Rule is set; the battery is still ramping up from standby (0.8 of 3.8 kW).'
+
+
+def test_check_reports_a_leftover_charge_rule():
+    assert 'still active' in check_inverter(normal_plan(), status(CHARGE))
+
+
+def test_check_agrees_with_no_rules_in_normal_mode():
+    assert check_inverter(normal_plan(), status(battery=-300)) is None
+
+
+def test_check_without_a_reading():
+    assert check_inverter(normal_plan(), None) == 'Could not read the rules from the inverter.'
+
+
+def test_the_cycle_stores_the_inverter_reading(bc):
+    bc.inverter.read_status.return_value = status(battery=-300)
+    result = bc.run()
+    assert result.inverter.battery_power_w == -300
+    assert result.inverter_check is None

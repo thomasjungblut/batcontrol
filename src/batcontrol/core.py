@@ -16,6 +16,7 @@ import pytz
 
 from . import rules
 from .inverter import InverterCommunicationError, create_inverter
+from .inverter.status import InverterStatus
 from .tibber import TibberPrices
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,8 @@ USED_BATTERY_CONTROL_KEYS = ('min_price_difference', 'min_recharge_amount')
 
 MANUAL_DEFAULT_MINUTES = 60
 MANUAL_MAX_MINUTES = 240
+# Below this share of the commanded rate a charge counts as "ramping up".
+RAMPING_SHARE = 0.5
 
 
 @dataclasses.dataclass(frozen=True)
@@ -38,7 +41,39 @@ class CycleResult:
     battery: rules.Battery
     slots: tuple                  # rules.Slot, current and future
     plan: rules.Plan
-    error: Optional[str] = None
+    inverter: Optional[InverterStatus] = None
+    inverter_check: Optional[str] = None
+
+
+def check_inverter(plan: rules.Plan,  # pylint: disable=too-many-return-statements
+                   status: Optional[InverterStatus]) -> Optional[str]:
+    """ Compare what the inverter reports with what the plan wants.
+
+    Returns None when they agree, otherwise one sentence for the dashboard.
+    ASCII only.
+    """
+    if status is None:
+        return 'Could not read the rules from the inverter.'
+    charge_rules = status.active_rules('CHARGE_MIN')
+    blocking = status.active_rules('DISCHARGE_MAX')
+    if plan.mode == rules.MODE_CHARGE:
+        if not charge_rules:
+            return 'Plan says charge, but the inverter has no active CHARGE_MIN rule.'
+        power = max(r.power_w for r in charge_rules)
+        if power + 1 < plan.charge_rate_w:
+            return (f'Inverter rule charges at {power:.0f} W, plan wants '
+                    f'{plan.charge_rate_w:.0f} W.')
+        battery = status.battery_power_w
+        if battery is not None and battery < RAMPING_SHARE * plan.charge_rate_w:
+            standby = ' from standby' if status.battery_standby else ''
+            return (f'Rule is set; the battery is still ramping up{standby} '
+                    f'({battery / 1000:.1f} of {plan.charge_rate_w / 1000:.1f} kW).')
+        return None
+    if charge_rules:
+        return 'Plan says normal, but a CHARGE_MIN rule is still active on the inverter.'
+    if blocking:
+        return 'A DISCHARGE_MAX rule on the inverter is blocking the battery.'
+    return None
 
 
 def settings_from_config(config: dict) -> rules.Settings:
@@ -177,14 +212,29 @@ class Batcontrol:  # pylint: disable=too-many-instance-attributes
         except InverterCommunicationError as exc:
             logger.warning('Could not set inverter mode: %s', exc)
             return None
+        status = self.read_inverter_status()
+        check = check_inverter(plan, status)
+        if check:
+            logger.info('Inverter check: %s', check)
         result = CycleResult(
             evaluated_at=time.time(),
             battery=battery,
             slots=tuple(slots),
             plan=plan,
+            inverter=status,
+            inverter_check=check,
         )
         self.last = result
         return result
+
+    def read_inverter_status(self) -> Optional[InverterStatus]:
+        """ Rules and power flow as the inverter reports them, None on error. """
+        try:
+            status = self.inverter.read_status()
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.warning('Could not read inverter status: %s', exc)
+            return None
+        return status if isinstance(status, InverterStatus) else None
 
     def shutdown(self) -> None:
         """ Restore the inverter configuration. """

@@ -172,6 +172,13 @@ body::after {
 .saving { text-align: right; white-space: nowrap; }
 #notes p { margin: 6px 0 0; }
 
+.rules { list-style: none; margin: 0 0 8px; padding: 0; font-size: 13px; }
+.rules li { padding: 2px 0; }
+.rules li.off { text-decoration: line-through; color: var(--fg-dim); text-shadow: none; }
+.flows { display: flex; flex-wrap: wrap; gap: 4px 22px; font-size: 13px; }
+.flows b { font-weight: 700; }
+#inverter-check { margin: 8px 0 0; }
+
 .strip { display: flex; align-items: flex-end; gap: 1px; height: 70px; padding-bottom: 14px; }
 .slot { position: relative; flex: 1 1 0; height: 100%; display: flex; align-items: flex-end; }
 .slot .b { width: 100%; background: var(--fg-faint); }

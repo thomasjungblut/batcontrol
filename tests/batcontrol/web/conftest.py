@@ -13,7 +13,8 @@ import pytz
 from fastapi.testclient import TestClient
 
 from batcontrol import rules
-from batcontrol.core import CycleResult
+from batcontrol.core import CycleResult, check_inverter
+from batcontrol.inverter.status import InverterRule, InverterStatus
 from batcontrol.web.app import create_app
 from batcontrol.web.config import ApiConfig
 
@@ -56,8 +57,13 @@ class FakeBatcontrol:
             battery = rules.Battery(soc=soc, capacity_wh=10000, min_soc=5, max_soc=100)
             slots = [s for s in make_slots() if s.end > now]
             plan = rules.plan(now, slots, battery, self.settings)
+            inverter = InverterStatus(
+                read_at=time.time(), rules=(), battery_mode='normal',
+                battery_standby=False, battery_power_w=-420.0,
+                grid_power_w=0.0, load_power_w=420.0, pv_power_w=0.0)
             self.last = CycleResult(evaluated_at=time.time(), battery=battery,
-                                    slots=tuple(slots), plan=plan)
+                                    slots=tuple(slots), plan=plan, inverter=inverter,
+                                    inverter_check=check_inverter(plan, inverter))
 
     @property
     def manual_until(self):

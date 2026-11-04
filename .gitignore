@@ -201,3 +201,7 @@ site/
 
 # Peak shaving scenario datasets for the documentation.
 
+
+# Backups of the Fronius settings, written at startup and restored at shutdown
+config/battery_config.json
+config/timeofuse_config.json

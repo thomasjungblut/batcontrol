@@ -29,6 +29,7 @@ from packaging import version
 from cachetools import TTLCache
 from ..value_utils import mask_sensitive_headers
 from .baseclass import DEFAULT_MAX_SOC, DEFAULT_MIN_SOC, InverterBaseclass
+from .status import InverterRule, InverterStatus
 
 logger = logging.getLogger(__name__)
 
@@ -220,9 +221,12 @@ class FroniusWR(InverterBaseclass):
         # Initialize SOC cache with 30-second TTL (maxsize=1 since we only cache one SOC value)
         self._soc_cache = TTLCache(maxsize=1, ttl=30)
 
-        # Initialize time of use cache with 15-minute TTL (maxsize=1 since we only cache one config)
-        # 15 minutes , 10 Seconds = 910 seconds
-        self._time_of_use_cache = TTLCache(maxsize=1, ttl=910)
+        # Time of use cache, shorter than one 3-minute control cycle: every
+        # cycle reads the rules fresh, so a rule changed or disabled outside
+        # batcontrol is noticed and rewritten on the next cycle.
+        self._time_of_use_cache = TTLCache(maxsize=1, ttl=170)
+        # Last power flow reading, kept for read_status().
+        self._powerflow = None
 
         if not self.previous_battery_config:
             raise RuntimeError(
@@ -299,6 +303,7 @@ class FroniusWR(InverterBaseclass):
             )
             return 99.0
         result = json.loads(response.text)
+        self._powerflow = (time.time(), result['Body']['Data'])
         soc = result['Body']['Data']['Inverters'][self.inverter_id]['SOC']
 
         # Cache the result
@@ -603,15 +608,25 @@ class FroniusWR(InverterBaseclass):
                 'Could not remove timeofuse config file %s', TIMEOFUSE_CONFIG_FILENAME
             )
 
+    @staticmethod
+    def _timeofuse_essentials(item):
+        """ The parts of a time of use entry that change behaviour. """
+        table = item.get('TimeTable') or {}
+        return (item.get('Active'), item.get('ScheduleType'), item.get('Power'),
+                table.get('Start'), table.get('End'))
+
     def _compare_timeofuse_essentials(self, current_timeofuse, new_timeofuse):
-        """Compare only ScheduleType and Power values of timeofuse configurations."""
+        """Compare Active, ScheduleType, Power and the time window.
+
+        Active and the window matter: a rule switched off in the Fronius UI
+        has the same type and power, and must still be rewritten.
+        """
         if len(current_timeofuse) != len(new_timeofuse):
             return False
 
         for i, (current_item, new_item) in enumerate(zip(current_timeofuse, new_timeofuse)):
-            # Compare only ScheduleType and Power values
-            if (current_item.get('ScheduleType') != new_item.get('ScheduleType') or
-                    current_item.get('Power') != new_item.get('Power')):
+            if self._timeofuse_essentials(current_item) != \
+                    self._timeofuse_essentials(new_item):
                 logger.debug("Time of use item %d differs in essential values: "
                              "ScheduleType current=%s vs new=%s, "
                              "Power current=%s vs new=%s",
@@ -1094,6 +1109,42 @@ class FroniusWR(InverterBaseclass):
         """ Change Energy Manangement mode."""
         self.__set_em(mode=mode)
         self.em_mode = mode
+
+    def read_status(self) -> InverterStatus:
+        """ The programmed rules and the last power flow reading.
+
+        Fronius signs: P_Akku < 0 charges, P_Load < 0 is consumption,
+        P_Grid > 0 imports. Converted to the InverterStatus convention.
+        """
+        rules = tuple(
+            InverterRule(
+                schedule_type=str(item.get('ScheduleType')),
+                power_w=float(item.get('Power') or 0),
+                start=str((item.get('TimeTable') or {}).get('Start', '')),
+                end=str((item.get('TimeTable') or {}).get('End', '')),
+                active=bool(item.get('Active')),
+            )
+            for item in (self.get_time_of_use() or [])
+        )
+        if self._powerflow is None:
+            self.get_SOC()
+        read_at, data = self._powerflow if self._powerflow else (time.time(), {})
+        site = data.get('Site') or {}
+        inverter = (data.get('Inverters') or {}).get(self.inverter_id) or {}
+
+        def neg(value):
+            return None if value is None else -float(value)
+
+        return InverterStatus(
+            read_at=read_at,
+            rules=rules,
+            battery_mode=inverter.get('Battery_Mode'),
+            battery_standby=site.get('BatteryStandby'),
+            battery_power_w=neg(site.get('P_Akku')),
+            grid_power_w=None if site.get('P_Grid') is None else float(site['P_Grid']),
+            load_power_w=neg(site.get('P_Load')),
+            pv_power_w=None if site.get('P_PV') is None else float(site['P_PV']),
+        )
 
     def shutdown(self):
         """Change back batcontrol changes."""

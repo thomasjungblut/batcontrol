@@ -75,6 +75,34 @@ class PriceSlotModel(BaseModel):
         None, description='Reason if this slot is a planned charge.')
 
 
+class InverterRuleModel(BaseModel):
+    """ One time-of-use rule as programmed on the inverter. """
+    schedule_type: str = Field(
+        description='CHARGE_MIN (charge with at least power_w, from the grid if '
+                    'needed), CHARGE_MAX, DISCHARGE_MIN or DISCHARGE_MAX.')
+    power_w: float = Field(description='Power limit of the rule, W.')
+    start: str = Field(description='Start, HH:MM inverter local time.')
+    end: str = Field(description='End, HH:MM inverter local time.')
+    active: bool
+
+
+class InverterModel(BaseModel):
+    """ What the inverter reports, read after the mode was set. """
+    read_at: int = Field(description='Time of the power flow reading, epoch ms.')
+    rules: List[InverterRuleModel] = Field(
+        description='Programmed time-of-use rules. Empty = the inverter runs on '
+                    'its own (normal operation).')
+    battery_mode: Optional[str] = Field(None, description="Fronius battery mode, e.g. 'normal'.")
+    battery_standby: Optional[bool] = None
+    battery_power_w: Optional[float] = Field(
+        None, description='Battery power, W. Positive = charging.')
+    grid_power_w: Optional[float] = Field(
+        None, description='Grid power, W. Positive = import.')
+    load_power_w: Optional[float] = Field(
+        None, description='House consumption, W.')
+    pv_power_w: Optional[float] = Field(None, description='PV production, W.')
+
+
 class StatusModel(BaseModel):  # pylint: disable=too-many-instance-attributes
     """ Everything the dashboard shows, from one control cycle. """
     version: str
@@ -93,6 +121,10 @@ class StatusModel(BaseModel):  # pylint: disable=too-many-instance-attributes
     manual_until: Optional[int] = Field(
         None, description='End of a running manual charge, epoch ms.')
     battery: BatteryModel
+    inverter: Optional[InverterModel] = Field(
+        None, description='None when the inverter could not be read.')
+    inverter_check: Optional[str] = Field(
+        None, description='Set when the inverter does not (yet) do what the plan says.')
     plan: PlanModel
     prices: List[PriceSlotModel] = Field(description='The next 24 h of prices.')
 

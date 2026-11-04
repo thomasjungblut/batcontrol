@@ -92,3 +92,11 @@ def test_writes_only_on_manual_charge(client):
     for path, ops in schema['paths'].items():
         if set(ops) - {'get'}:
             assert path == '/api/v1/manual-charge'
+
+
+def test_status_shows_what_the_inverter_reports(client):
+    data = client.get('/api/v1/status').json()['data']
+    assert data['inverter']['rules'] == []
+    assert data['inverter']['battery_power_w'] == -420
+    assert data['inverter']['load_power_w'] == 420
+    assert data['inverter_check'] is None

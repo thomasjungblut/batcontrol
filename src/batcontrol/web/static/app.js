@@ -108,6 +108,51 @@ function renderNow(s) {
     : '>CHARGE FULL SPEED FOR 1 H<'
 }
 
+// Fronius time-of-use rule types in plain words.
+const RULE_WORDS = {
+  CHARGE_MIN: (w) => `charge with at least ${kw(w)} (from the grid if needed)`,
+  CHARGE_MAX: (w) => (w > 0 ? `charge with at most ${kw(w)}` : 'do not charge'),
+  DISCHARGE_MIN: (w) => `discharge with at least ${kw(w)}`,
+  DISCHARGE_MAX: (w) => (w > 0 ? `discharge with at most ${kw(w)}` : 'do not discharge'),
+}
+
+const kw = (w) => (w == null ? '-' : `${(w / 1000).toFixed(1)} kW`)
+
+function renderInverter(s) {
+  const inv = s.inverter
+  const rules = $('rules')
+  if (!inv) {
+    rules.replaceChildren(el('li', { class: 'dim' }, 'Inverter not readable this cycle.'))
+    $('flows').replaceChildren()
+  } else {
+    rules.replaceChildren(...(inv.rules.length
+      ? inv.rules.map((r) => {
+        const words = (RULE_WORDS[r.schedule_type] || (() => r.schedule_type))(r.power_w)
+        return el('li', { class: r.active ? '' : 'off', title: `${r.schedule_type} ${r.power_w} W` },
+          el('b', {}, `${r.start}–${r.end} `), words,
+          el('span', { class: 'dim' }, ` · ${r.schedule_type} ${r.power_w} W${r.active ? '' : ' (inactive)'}`))
+      })
+      : [el('li', {}, 'No rules: the inverter runs on its own (normal operation).')]))
+    const battery = inv.battery_power_w
+    const batteryText = battery == null ? '-'
+      : `${battery > 0 ? '+' : ''}${kw(battery)} ${battery > 50 ? 'charging' : battery < -50 ? 'discharging' : 'idle'}`
+    const grid = inv.grid_power_w
+    const gridText = grid == null ? '-' : `${kw(Math.abs(grid))} ${grid > 0 ? 'import' : 'export'}`
+    const mode = [inv.battery_mode, inv.battery_standby ? 'standby' : null].filter(Boolean).join(', ')
+    const item = (label, value) => el('span', {}, el('span', { class: 'dim' }, `${label} `), el('b', {}, value))
+    $('flows').replaceChildren(
+      item('battery', batteryText),
+      item('grid', gridText),
+      item('house', kw(inv.load_power_w)),
+      item('pv', kw(inv.pv_power_w)),
+      mode ? item('mode', mode) : null,
+      el('span', { class: 'dim' }, `read ${clock(inv.read_at)}`))
+  }
+  const check = $('inverter-check')
+  check.hidden = !s.inverter_check
+  check.textContent = s.inverter_check ? `!! ${s.inverter_check}` : ''
+}
+
 function renderPlan(s) {
   const plan = s.plan
   $('plan-title').textContent =
@@ -169,6 +214,7 @@ function render(s) {
   renderBattery(s)
   renderSavings(s)
   renderNow(s)
+  renderInverter(s)
   renderPlan(s)
   renderPrices(s)
   $('loading').hidden = true
