@@ -54,7 +54,7 @@ logged once at startup).
 ## Run
 
 ```bash
-docker compose up -d              # config and logs in /share/Container/batcontrol, see below
+docker compose up -d              # ./config and ./logs next to compose.yaml
 # or from source
 uv venv --python 3.14 && uv pip install -e '.[test]'
 python -m batcontrol --config config/batcontrol_config.yaml [--one-shot]
@@ -67,10 +67,9 @@ and `latest`; `NO_PUSH=1` builds only):
 scripts/build-and-push.sh
 ```
 
-The image is `python:3.14-slim` (Debian). `config/` and `logs/` live in a fixed host folder,
-`/share/Container/batcontrol`, so recreating the container keeps the config. Create the
-folder once; set `BATCONTROL_DIR` to use another one
-(`BATCONTROL_DIR=. docker compose up -d --build` for a local checkout).
+The image is `python:3.14-slim` (Debian). Keep the `volumes:` entries of `compose.yaml`:
+without them `config/` lives in an anonymous volume, and a recreated container starts
+over with the template config.
 
 On first start with an empty `config/` it copies a template config and exits; fill it in
 and start again. Set `TZ` in `compose.yaml` and make the published port match `api.port`.

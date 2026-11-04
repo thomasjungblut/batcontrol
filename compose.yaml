@@ -5,12 +5,12 @@ services:
     environment:
       - TZ=Europe/Berlin
     volumes:
-      # A fixed host folder, not ./config, so recreating the container never
-      # loses batcontrol_config.yaml or the inverter backup restored on
-      # shutdown. Override with BATCONTROL_DIR (BATCONTROL_DIR=. for a local
-      # checkout).
-      - ${BATCONTROL_DIR:-/share/Container/batcontrol}/config:/app/config
-      - ${BATCONTROL_DIR:-/share/Container/batcontrol}/logs:/app/logs
+      # Required: without these, Docker keeps config/ and logs/ in anonymous
+      # volumes, and a recreated container starts with the template config
+      # again. config/ holds batcontrol_config.yaml and the inverter backup
+      # restored on shutdown.
+      - './config:/app/config'
+      - './logs:/app/logs'
     # Must match api.port in the config.
     ports:
       - "8080:8080"
