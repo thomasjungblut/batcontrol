@@ -1,3 +1,5 @@
+.idea
+
 # Batcontrol specific stuff
 *batcontrol_config.yaml
 *.log
