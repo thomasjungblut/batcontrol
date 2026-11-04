@@ -1,0 +1,15 @@
+services:
+  batcontrol:
+    build: .
+    image: batcontrol:local
+    environment:
+      - TZ=Europe/Berlin
+    volumes:
+      - ./config:/app/config
+      - ./logs:/app/logs
+    # Must match api.port in the config.
+    ports:
+      - "8080:8080"
+    # Give batcontrol time to restore the inverter settings on shutdown.
+    stop_grace_period: 30s
+    restart: unless-stopped

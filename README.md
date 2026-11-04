@@ -42,12 +42,17 @@ logged once at startup).
 ## Run
 
 ```bash
-docker build -t batcontrol .
-docker run -v ./config:/app/config -v ./logs:/app/logs -p 8080:8080 batcontrol
+docker compose up -d --build      # see compose.yaml: ./config and ./logs as volumes
 # or from source
 uv venv --python 3.14 && uv pip install -e '.[test]'
 python -m batcontrol --config config/batcontrol_config.yaml [--one-shot]
 ```
+
+The image is `python:3.14-slim` (Debian). On first start with an empty `./config` it
+copies a template config and exits; fill it in and start again. Set `TZ` in
+`compose.yaml` and make the published port match `api.port`. `docker stop` sends
+SIGTERM, batcontrol then restores the inverter settings it changed (from the backup
+files in `./config`) before it exits.
 
 The dashboard is at `http://<host>:<api.port>/`. It is plain HTML/CSS/JS in
 `src/batcontrol/web/static/`, with no build step.

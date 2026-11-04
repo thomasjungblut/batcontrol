@@ -1,66 +1,55 @@
-# Stage 1: Build the wheel
-FROM python:3.14-alpine AS builder
+# batcontrol on Debian slim. Every dependency ships a manylinux wheel, so
+# nothing is compiled and no build tools end up in the image.
 
-# Install uv for fast, reliable Python packaging
-COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /usr/local/bin/uv
+# Stage 1: install the package into a virtualenv
+FROM python:3.14-slim AS builder
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN python -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
 
 WORKDIR /build
-
-# Copy only whats needed for dependencies first
 COPY pyproject.toml LICENSE README.md ./
+COPY src ./src
+RUN pip install .
 
-# Copy the rest of the source files
-COPY ./src ./src
 
-# Build a wheel
-RUN uv build --wheel --out-dir /wheels
+# Stage 2: runtime
+FROM python:3.14-slim
 
-# Stage 2: Build the final image
-FROM python:3.14-alpine
+ARG VERSION=dev
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.title="batcontrol" \
+      org.opencontainers.image.description="Simple battery rules for Fronius GEN24 and Tibber" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${GIT_SHA}"
 
-ARG VERSION
-ARG GIT_SHA
+# tzdata: log timestamps follow TZ (set it in compose, e.g. Europe/Berlin).
+RUN export DEBIAN_FRONTEND=noninteractive \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
 
-LABEL version="${VERSION}"
-LABEL git-sha="${GIT_SHA}"
-LABEL description="This is a Docker image for the BatControl project."
-LABEL maintainer="matthias.strubel@aod-rpg.de"
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    TZ=UTC \
+    BATCONTROL_VERSION=${VERSION} \
+    BATCONTROL_GIT_SHA=${GIT_SHA}
 
-# Install uv for fast, reliable Python packaging
-COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /usr/local/bin/uv
-
-# Copy the built wheel from the builder stage and install it
-COPY --from=builder /wheels /wheels
-
-# Install runtime dependencies using uv
-# Prefer piwheels for compatible wheels and fall back to PyPI
-RUN uv pip install --system --no-cache --index-url https://piwheels.org/simple --extra-index-url https://pypi.org/simple /wheels/*.whl && \
-    rm -rf /wheels /usr/local/bin/uv
-
-ENV BATCONTROL_VERSION=${VERSION}
-ENV BATCONTROL_GIT_SHA=${GIT_SHA}
-ENV BATCONTROL_RUNTIME_ENV="docker"
-# Set default timezone to UTC, override with -e TZ=Europe/Berlin or similar
-# when starting the container
-# or set the timezone in docker-compose.yml in the environment section,
-ENV TZ=UTC
-
-# Create the app directory and copy the app files
-RUN mkdir -p /app /app/logs /app/config /app/data
 WORKDIR /app
+# config/ holds batcontrol_config.yaml and the Fronius settings backup that
+# is restored on shutdown, so it has to be a volume.
+COPY config/batcontrol_config_dummy.yaml /app/config_template/
+COPY entrypoint.sh /app/
+RUN mkdir -p /app/config /app/logs
+VOLUME ["/app/config", "/app/logs"]
 
-# Copy all the other necessary runtime files
-COPY LICENSE entrypoint.sh ./
-COPY config ./config_template
-
-# Set the scripts as executable
-RUN chmod +x entrypoint.sh
-
-VOLUME ["/app/logs", "/app/config", "/app/data"]
-
-# REST API and dashboard. Only reachable when api.enabled is
-# set in the configuration, and the bind address has to be 0.0.0.0 for a
-# published port to work.
+# Dashboard and API, when api.enabled is set and api.host is 0.0.0.0.
 EXPOSE 8080
 
-CMD ["/bin/sh", "/app/entrypoint.sh"]
+# exec in the entrypoint makes python PID 1, so SIGTERM from "docker stop"
+# reaches batcontrol and it restores the inverter settings before exiting.
+ENTRYPOINT ["/bin/sh", "/app/entrypoint.sh"]
