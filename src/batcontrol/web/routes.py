@@ -1,309 +1,161 @@
-""" HTTP routes of the read-only API
+""" Routes of the web API.
 
-Every route in here is a GET. There is no POST, PUT, PATCH or DELETE, and
-tests/batcontrol/web/test_readonly.py enforces that: the API reads batcontrol,
-it never steers it. Control stays with the MQTT API.
-
-Two routers:
-  public_router    - /health only, reachable without a token
-  router           - everything else, behind the optional bearer token
+GET /health and /status read the last control cycle; nothing here talks to
+the inverter. The only write is the manual charge, which just records the
+request and wakes the control loop up - the loop then sets the mode.
 """
-import logging
+import datetime
 import time
-from typing import Any, Dict, Optional
+from typing import Optional
 
-from fastapi import APIRouter, Path, Query, Request
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
+from .. import __pkginfo__
+from .. import rules
 from .models import (
-    Battery, Configuration, Current, Decision, DecisionHistory,
-    Envelope, ForecastBundle, ForecastSeries, Health, Inverter, InverterList,
-    PeakShavingStatus, PriceStatus, SolarMetrics, Status, Version,
+    BatteryModel, ChargeModel, Envelope, Health, ManualChargeModel,
+    ManualChargeRequest, PlanModel, PriceSlotModel, StatusModel,
 )
-from .service import HISTORY_MAX, WINDOW_MAX, BatcontrolService
 
-logger = logging.getLogger(__name__)
-
-TAG_META = 'meta'
-TAG_STATUS = 'status'
-TAG_PRICE = 'price'
-TAG_INVERTER = 'inverter'
-TAG_FORECAST = 'forecast'
-TAG_DECISION = 'decision'
-TAG_CONFIG = 'config'
-
-# Default and maximum number of traces returned by the history endpoint. The
-# journal keeps 200 by default; a full dump is large, so the default is small.
-HISTORY_DEFAULT = 20
+# The loop evaluates every 3 minutes; three missed cycles mean "offline".
+OFFLINE_AFTER_SECONDS = 10 * 60
+PRICE_HORIZON = datetime.timedelta(hours=24)
 
 public_router = APIRouter()
 router = APIRouter()
 
-# REST clients default to the whole horizon - the dashboard wants it - while
-# the MCP tools default to 24 hours and page for more.
-LIMIT_QUERY = Query(
-    None, ge=1, le=WINDOW_MAX,
-    description='Maximum number of slots to return. Omit for the whole'
-                ' horizon.')
-OFFSET_QUERY = Query(
-    0, ge=0, le=WINDOW_MAX,
-    description='Slot index to start at, for paging through the horizon.')
+
+class NoDataAvailable(Exception):
+    """ Raised before the first control cycle has finished. """
 
 
-def now_ms() -> int:
-    """ Current server time in epoch milliseconds. """
-    return int(time.time() * 1000)
+def error_envelope(code: str, detail: str) -> dict:
+    """ Body of every error response. """
+    return {'ok': False, 'error': code, 'detail': detail}
 
 
-def envelope(data: Any) -> Dict[str, Any]:
-    """ Wrap a payload in the common response envelope. """
-    return {'ok': True, 'timestamp': now_ms(), 'data': data}
+def no_data_response() -> JSONResponse:
+    """ 503 before the first cycle. """
+    return JSONResponse(status_code=503, content=error_envelope(
+        'no_data', 'batcontrol has not completed a control cycle yet.'))
 
 
-def error_envelope(code: str, detail: str) -> Dict[str, Any]:
-    """ The envelope of every non-2xx response. """
-    return {'ok': False, 'timestamp': now_ms(), 'error': code,
-            'detail': detail}
+def ms(when) -> Optional[int]:
+    """ datetime or epoch seconds to epoch ms. """
+    if when is None:
+        return None
+    if isinstance(when, datetime.datetime):
+        return int(when.timestamp() * 1000)
+    return int(when * 1000)
 
 
-def service(request: Request) -> BatcontrolService:
-    """ The service layer instance attached to the application. """
-    return request.app.state.service
+def _charge(charge: rules.Charge, now: datetime.datetime) -> ChargeModel:
+    return ChargeModel(
+        reason=charge.reason,
+        start=ms(charge.start),
+        end=ms(charge.end),
+        price=round(charge.price, 4),
+        energy_wh=round(charge.energy_wh, 1),
+        compare_price=round(charge.compare_price, 4),
+        compare_start=ms(charge.compare_start),
+        compare_end=ms(charge.compare_end),
+        spread=round(charge.spread, 4),
+        saving_eur=round(charge.saving_eur, 3),
+        active=charge.start <= now < charge.end,
+        explanation=charge.explanation,
+    )
 
 
-@public_router.get(
-    '/health',
-    response_model=Envelope[Health],
-    tags=[TAG_META],
-    summary='Liveness of the control loop',
-    description='Answers even before the first control cycle has completed,'
-                ' so it is usable as a container health check. This is the'
-                ' only endpoint that stays reachable without a token when'
-                ' api.auth_token is configured.',
-)
-def get_health(request: Request) -> Dict[str, Any]:
-    """ Liveness and freshness of the control loop. """
-    return envelope(service(request).health())
+def _charge_reason(slot: rules.Slot, plan: rules.Plan) -> Optional[str]:
+    for charge in plan.charges:
+        if charge.start <= slot.start < charge.end:
+            return charge.reason
+    return None
 
 
-@router.get(
-    '/version',
-    response_model=Envelope[Version],
-    tags=[TAG_META],
-    summary='Version and runtime identification',
-)
-def get_version(request: Request) -> Dict[str, Any]:
-    """ Version, build and runtime environment. """
-    return envelope(service(request).version())
-
-
-@router.get(
-    '/status',
-    response_model=Envelope[Status],
-    tags=[TAG_STATUS],
-    summary='Current control state',
-    description='The inverter mode batcontrol has set, who set it, and when'
-                ' the next evaluation is due.',
-)
-def get_status(request: Request) -> Dict[str, Any]:
-    """ What batcontrol is doing right now. """
-    return envelope(service(request).status())
-
-
-@router.get(
-    '/battery',
-    response_model=Envelope[Battery],
-    tags=[TAG_STATUS],
-    summary='Battery state and limits',
-    description='State of charge, capacities and the SoC limits. Values are'
-                ' the ones cached by the last control cycle - reading this'
-                ' endpoint never queries the inverter.',
-)
-def get_battery(request: Request) -> Dict[str, Any]:
-    """ Battery state and the limits needed to render it. """
-    return envelope(service(request).battery())
-
-
-@router.get(
-    '/current',
-    response_model=Envelope[Current],
-    tags=[TAG_STATUS],
-    summary='Current price and SoC in one call',
-    description='Convenience endpoint for dashboards: the current price is'
-                ' always populated, independent of which decision path ran.'
-                ' Returns 503 until the first control cycle has completed.',
-)
-def get_current(request: Request) -> Dict[str, Any]:
-    """ Current price situation plus SoC and its limits. """
-    return envelope(service(request).current())
-
-
-@router.get(
-    '/price/status',
-    response_model=Envelope[PriceStatus],
-    tags=[TAG_PRICE],
-    summary='Price statistics for the next 24 hours',
-    description='Current price with its rank, cheapest and most expensive'
-                ' slot, average and spread over the next 24 hours, per slot at'
-                ' the configured resolution. The window is independent of the'
-                ' optimizer horizon and cut short where the forecast ends'
-                ' (complete=false). Returns 503 until the first control cycle'
-                ' has completed.',
-)
-def get_price_status(request: Request) -> Dict[str, Any]:
-    """ Price statistics over the next 24 hours. """
-    return envelope(service(request).price_status())
-
-
-@router.get(
-    '/forecast',
-    response_model=Envelope[ForecastBundle],
-    tags=[TAG_FORECAST],
-    summary='All forecast series of the last cycle',
-    description='Price, consumption, production and net consumption in one'
-                ' response, so a dashboard needs a single request. All series'
-                ' share the same slot grid.',
-)
-def get_forecast(
-        request: Request,
-        limit: Optional[int] = LIMIT_QUERY,
-        offset: int = OFFSET_QUERY,
-) -> Dict[str, Any]:
-    """ All four forecast series of the last control cycle. """
-    return envelope(service(request).forecast_all(limit=limit, offset=offset))
-
-
-@router.get(
-    '/forecast/{series}',
-    response_model=Envelope[ForecastSeries],
-    tags=[TAG_FORECAST],
-    summary='One forecast series',
-    description='`price` is EUR/kWh per slot. `consumption`, `production` and'
-                ' `net_consumption` are Wh per slot and additionally carry'
-                ' `power_w`, the average power over the slot. Negative'
-                ' net_consumption means surplus solar energy.',
-)
-def get_forecast_series(
-        request: Request,
-        series: str = Path(
-            ...,
-            description='price, consumption, production or net_consumption',
-            examples=['price'],
+def build_status(bc) -> StatusModel:
+    """ The status view of the last cycle. """
+    result = bc.last
+    if result is None:
+        raise NoDataAvailable()
+    plan = result.plan
+    battery = result.battery
+    now = plan.computed_at
+    manual = bc.manual_until
+    return StatusModel(
+        version=__pkginfo__.__version__,
+        online=time.time() - result.evaluated_at < OFFLINE_AFTER_SECONDS,
+        evaluated_at=ms(result.evaluated_at),
+        next_evaluation=ms(bc.next_evaluation),
+        mode=plan.mode,
+        reason=plan.reason,
+        headline=plan.headline,
+        charge_rate_w=plan.charge_rate_w,
+        max_charge_rate_w=bc.settings.max_charge_rate_w,
+        min_price_difference=bc.settings.min_price_difference,
+        manual_until=ms(manual),
+        battery=BatteryModel(
+            soc=battery.soc,
+            stored_wh=round(battery.stored_wh, 1),
+            usable_wh=round(battery.usable_wh, 1),
+            capacity_wh=battery.capacity_wh,
+            min_soc=battery.min_soc,
+            max_soc=battery.max_soc,
         ),
-        limit: Optional[int] = LIMIT_QUERY,
-        offset: int = OFFSET_QUERY,
-) -> Dict[str, Any]:
-    """ A single forecast series. """
-    return envelope(
-        service(request).forecast(series, limit=limit, offset=offset))
+        plan=PlanModel(
+            night_start=ms(plan.night_start),
+            night_end=ms(plan.night_end),
+            preview=plan.preview,
+            reserve_wh=round(plan.reserve_wh, 1),
+            deficit_wh=round(plan.deficit_wh, 1),
+            saving_eur=round(plan.saving_eur, 3),
+            monthly_saving_eur=round(plan.monthly_saving_eur, 2),
+            charges=[_charge(c, now) for c in plan.charges],
+            notes=list(plan.notes),
+        ),
+        prices=[
+            PriceSlotModel(start=ms(s.start), price=round(s.price, 4),
+                           charge=_charge_reason(s, plan))
+            for s in result.slots if s.start < now + PRICE_HORIZON
+        ],
+    )
 
 
-@router.get(
-    '/solar',
-    response_model=Envelope[SolarMetrics],
-    tags=[TAG_FORECAST],
-    summary='Solar surplus indicators',
-    description='Whether solar is producing, the expected surplus that does'
-                ' not fit into the battery, and how low the battery gets until'
-                ' and across the next solar window - derived from the'
-                ' forecast in the last control cycle. Returns 503 until the'
-                ' logic has run once.',
-)
-def get_solar(request: Request) -> Dict[str, Any]:
-    """ Surplus indicators from the last control cycle. """
-    return envelope(service(request).solar())
+def _manual(bc) -> ManualChargeModel:
+    until = bc.manual_until
+    return ManualChargeModel(active=until is not None, until=ms(until))
 
 
-@router.get(
-    '/peak-shaving',
-    response_model=Envelope[PeakShavingStatus],
-    tags=[TAG_DECISION],
-    summary='Peak shaving runtime state',
-    description='Whether peak shaving ran in the last cycle, whether evcc'
-                ' suspended it, the resulting PV charge limit and the outcome'
-                ' of its rules. The parameters are in /config. Returns 503'
-                ' until the logic has run once.',
-)
-def get_peak_shaving(request: Request) -> Dict[str, Any]:
-    """ What peak shaving decided in the last cycle. """
-    return envelope(service(request).peak_shaving())
+@public_router.get('/health', response_model=Envelope[Health])
+def health():
+    """ Liveness check, never needs a token. """
+    return Envelope(data=Health(status='ok'))
 
 
-@router.get(
-    '/inverters',
-    response_model=Envelope[InverterList],
-    tags=[TAG_INVERTER],
-    summary='Inverters by id',
-    description='The inverters batcontrol controls. With several inverters'
-                ' the other endpoints report them as one battery; use the ids'
-                ' here with /inverter/{inverter_id} for a single one.',
-)
-def get_inverters(request: Request) -> Dict[str, Any]:
-    """ The ids of all inverters. """
-    return envelope(service(request).inverters())
+@router.get('/status', response_model=Envelope[StatusModel])
+def status(request: Request):
+    """ Battery, current mode with its reason, the plan and the prices. """
+    return Envelope(data=build_status(request.app.state.batcontrol))
 
 
-@router.get(
-    '/inverter/{inverter_id}',
-    response_model=Envelope[Inverter],
-    tags=[TAG_INVERTER],
-    summary='Values of one inverter',
-    description='The values the inverter reported in the last control cycle,'
-                ' cached by the inverter itself - reading this endpoint never'
-                ' queries the inverter. Returns 404 for an unknown id and 503'
-                ' before the first read.',
-)
-def get_inverter(
-        request: Request,
-        inverter_id: int = Path(
-            ..., ge=0, description='Inverter id from /inverters.',
-            examples=[0]),
-) -> Dict[str, Any]:
-    """ One inverter's cached values. """
-    return envelope(service(request).inverter(inverter_id))
+@router.get('/manual-charge', response_model=Envelope[ManualChargeModel])
+def manual_state(request: Request):
+    """ Whether a manual charge is running. """
+    return Envelope(data=_manual(request.app.state.batcontrol))
 
 
-@router.get(
-    '/decision',
-    response_model=Envelope[Decision],
-    tags=[TAG_DECISION],
-    summary='Why batcontrol chose the current mode',
-    description='The latest decision trace with its decisive step and a'
-                ' plain language explanation. The record shapes are'
-                ' documented in the decision trace developer docs.',
-)
-def get_decision(request: Request) -> Dict[str, Any]:
-    """ The latest decision trace. """
-    return envelope(service(request).decision())
+@router.post('/manual-charge', response_model=Envelope[ManualChargeModel])
+def manual_start(request: Request, body: Optional[ManualChargeRequest] = None):
+    """ Charge at full speed for `minutes` (default 60). """
+    bc = request.app.state.batcontrol
+    bc.start_manual_charge((body or ManualChargeRequest()).minutes)
+    return Envelope(data=_manual(bc))
 
 
-@router.get(
-    '/decision/history',
-    response_model=Envelope[DecisionHistory],
-    tags=[TAG_DECISION],
-    summary='Recent decisions',
-    description='Traces from the in-memory journal, oldest first. The journal'
-                ' is not persisted: it starts empty after a restart.',
-)
-def get_decision_history(
-        request: Request,
-        limit: int = Query(
-            HISTORY_DEFAULT, ge=1, le=HISTORY_MAX,
-            description='Maximum number of traces to return.'),
-) -> Dict[str, Any]:
-    """ The last decisions from the journal. """
-    return envelope(service(request).decision_history(limit=limit))
-
-
-@router.get(
-    '/config',
-    response_model=Envelope[Configuration],
-    tags=[TAG_CONFIG],
-    summary='Runtime parameters',
-    description='The parameters that explain batcontrol\'s behaviour. This is'
-                ' an explicit allow-list of runtime values, not a dump of the'
-                ' configuration file: inverter passwords, tariff tokens and'
-                ' MQTT credentials are not reachable from here.',
-)
-def get_config(request: Request) -> Dict[str, Any]:
-    """ Runtime parameters, never credentials. """
-    return envelope(service(request).configuration())
+@router.delete('/manual-charge', response_model=Envelope[ManualChargeModel])
+def manual_cancel(request: Request):
+    """ Stop a manual charge; the rules take over again. """
+    bc = request.app.state.batcontrol
+    bc.cancel_manual_charge()
+    return Envelope(data=_manual(bc))

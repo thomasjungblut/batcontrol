@@ -17,7 +17,7 @@ def test_defaults_of_an_enabled_block():
     parsed = web_config.from_config({'api': {'enabled': True}})
     assert parsed.enabled is True
     assert parsed.dashboard_enabled is True
-    assert parsed.mcp_enabled is False
+    assert parsed.docs_enabled is False
 
 
 def test_home_assistant_string_values_are_accepted():
@@ -26,12 +26,12 @@ def test_home_assistant_string_values_are_accepted():
         'enabled': 'true',
         'port': '8099',
         'dashboard_enabled': 'false',
-        'mcp_enabled': 'TRUE',
+        'docs_enabled': 'TRUE',
     }})
     assert parsed.enabled is True
     assert parsed.port == 8099
     assert parsed.dashboard_enabled is False
-    assert parsed.mcp_enabled is True
+    assert parsed.docs_enabled is True
 
 
 @pytest.mark.parametrize('port', [0, -1, 65536, 'http', [8080]])
@@ -129,7 +129,6 @@ def test_a_bracketed_ipv6_host_is_bindable():
     {'enabled': False, 'port': ''},
     {'enabled': False, 'host': ''},
     {'enabled': False, 'host': '   '},
-    {'enabled': False, 'mcp_enabled': ''},
     {'enabled': False, 'dashboard_enabled': ''},
     {'enabled': '', 'port': 8080},
     {'enabled': 'true', 'host': '', 'port': '', 'auth_token': ''},

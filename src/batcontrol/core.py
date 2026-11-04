@@ -1,1728 +1,194 @@
-#! /usr/bin/env python
-""" Batcontrol Core Module
+""" The control loop: read battery and prices, evaluate the rules, set the mode.
 
-This module is the main entry point for Batcontrol.
-
-It handles the logic and control of the battery system, including:
-  - Fetching forecasts for consumption, production, and prices
-  - Calculating the optimal charging/discharging strategy
-  - Interfacing with the inverter and external APIs (MQTT, evcc)
-
+One evaluation every few minutes (see __main__.py). The web thread only reads
+`self.last` (one immutable object, replaced in one assignment) and can ask
+for a manual charge, which wakes the loop up instead of touching the
+inverter from a request thread.
 """
-# %%
-import datetime
-import time
-import os
-import logging
-import platform
-from pathlib import Path
-import functools
-import contextlib
-import threading
-
 import dataclasses
-from typing import Optional
+import datetime
+import logging
+import threading
+import time
+from typing import List, Optional
 
 import pytz
-import numpy as np
 
-from .mqtt_api import MqttApi
-from .evcc_api import EvccApi
-from .scheduler import SchedulerThread
-
-from .logic import Logic as LogicFactory
-from .logic import CalculationInput, CalculationParameters
-from .logic import CommonLogic
-from .logic import PeakShavingConfig
-from .logic.grid_charge_target import GridChargeTargetConfig
-from .logic.decision_trace import (
-    Decision, DecisionRecord, DecisionTrace, Outcome, Reason,
-)
-from .decision_journal import DecisionJournal
-from .web import config as web_config
-from .web.snapshot import ForecastSnapshot
-# Mode constants live in modes.py so the web API can import them without
-# pulling in core.py; re-exported here for backwards compatibility.
-from .modes import (                     # noqa: F401  pylint: disable=unused-import
-    MODE_ALLOW_DISCHARGING,
-    MODE_LIMIT_BATTERY_CHARGE_RATE,
-    MODE_AVOID_DISCHARGING,
-    MODE_FORCE_CHARGING,
-    MODE_NAMES,
-)
-
-from .dynamictariff import DynamicTariff as tariff_factory
-from .inverter import Inverter as inverter_factory
-from .inverter import InverterError, InverterCommunicationError
-from .inverter import inverter_members
-from .forecastsolar import ForecastSolar as solar_factory
-
-from .forecastconsumption import Consumption as consumption_factory
-from .forecast_metrics import ForecastMetrics
-from .runtime_state import (
-    BatteryState, CalculationResult, ConfiguredParameters, PeakShavingState,
-    SolarMetrics, as_number, cap_reserved_energy,
-)
-from .value_utils import (
-    parse_bool_flag,
-    parse_optional_ratio,
-    parse_positive_number,
-)
-
-ERROR_IGNORE_TIME = 600  # 10 Minutes
-EVALUATIONS_EVERY_MINUTES = 3  # Every x minutes on the clock
-DELAY_EVALUATION_BY_SECONDS = 15  # Delay evaluation for x seconds at every trigger
-# Interval between evaluations in seconds
-TIME_BETWEEN_EVALUATIONS = EVALUATIONS_EVERY_MINUTES * 60
-TIME_BETWEEN_UTILITY_API_CALLS = 900  # 15 Minutes
-MIN_FORECAST_HOURS = 1  # Minimum required forecast hours
-
-CONTROL_SOURCE_API = 'api'
-CONTROL_SOURCE_OPTIMIZER = 'optimizer'
+from . import rules
+from .inverter import InverterCommunicationError, create_inverter
+from .tibber import TibberPrices
 
 logger = logging.getLogger(__name__)
 
+# Config keys of earlier versions that are accepted and ignored, so an
+# existing configuration keeps working unchanged.
+IGNORED_SECTIONS = ('consumption_forecast', 'solar_forecast_provider',
+                    'pvinstallations', 'mqtt', 'evcc', 'battery_control_expert',
+                    'peak_shaving', 'solar_limit', 'dynamic_network_fees')
+USED_BATTERY_CONTROL_KEYS = ('min_price_difference', 'min_recharge_amount')
 
-class _PendingTrace(threading.local):
-    """ Trace staged for the next mode change, one per thread """
-    trace = None
+MANUAL_DEFAULT_MINUTES = 60
+MANUAL_MAX_MINUTES = 240
 
 
-def _tolerate_inverter_outage(func):
-    """Swallow inverter outages for externally triggered (API/evcc) actions.
+@dataclasses.dataclass(frozen=True)
+class CycleResult:
+    """ Everything one evaluation produced, read by the web API. """
+    evaluated_at: float           # epoch seconds
+    battery: rules.Battery
+    slots: tuple                  # rules.Slot, current and future
+    plan: rules.Plan
+    error: Optional[str] = None
 
-    These run on background threads in response to MQTT/evcc events. If the
-    inverter is briefly unavailable the request is dropped and logged; the
-    next scheduled run() reconciles the inverter state. Background calls
-    advance the shared outage clock in the resilient wrapper; termination on
-    a permanent outage is only triggered from the main run() loop.
-    """
-    @functools.wraps(func)
-    def wrapper(self, *args, **kwargs):
+
+def settings_from_config(config: dict) -> rules.Settings:
+    """ The rule parameters, from the existing config keys. """
+    bc = config.get('battery_control') or {}
+    inverter = config.get('inverter') or {}
+    rate = inverter.get('max_grid_charge_rate', inverter.get('max_charge_rate'))
+    if rate is None:
+        raise RuntimeError('inverter.max_grid_charge_rate is required')
+    return rules.Settings(
+        max_charge_rate_w=float(rate),
+        min_price_difference=float(bc.get('min_price_difference',
+                                          rules.DEFAULT_MIN_PRICE_DIFFERENCE)),
+        min_recharge_wh=float(bc.get('min_recharge_amount',
+                                     rules.DEFAULT_MIN_RECHARGE_WH)),
+    )
+
+
+def _log_ignored(config: dict) -> None:
+    ignored: List[str] = [k for k in IGNORED_SECTIONS if k in config]
+    bc = config.get('battery_control') or {}
+    ignored += [f'battery_control.{k}' for k in bc
+                if k not in USED_BATTERY_CONTROL_KEYS]
+    if ignored:
+        logger.info('Ignoring config keys that the simple rules do not use: %s',
+                    ', '.join(ignored))
+    resolution = config.get('time_resolution_minutes', 15)
+    if int(resolution) != 15:
+        logger.warning('time_resolution_minutes=%s ignored, always using 15 minutes',
+                       resolution)
+
+
+class Batcontrol:  # pylint: disable=too-many-instance-attributes
+    """ Owns the inverter, the price source and the last evaluation. """
+
+    def __init__(self, config: dict, *, inverter=None, prices=None):
+        self.timezone = pytz.timezone(config.get('timezone', 'Europe/Berlin'))
+        _log_ignored(config)
+        self.settings = settings_from_config(config)
+
+        utility = config.get('utility') or {}
+        if prices is None:
+            if str(utility.get('type', '')).lower() != 'tibber':
+                raise RuntimeError(
+                    f'Unsupported utility type "{utility.get("type")}". '
+                    'Only "tibber" is supported.')
+            prices = TibberPrices(utility.get('api_token') or utility.get('apikey'),
+                                  self.timezone)
+        self.prices = prices
+        self.inverter = inverter if inverter is not None \
+            else create_inverter(config['inverter'])
+
+        self.last: Optional[CycleResult] = None
+        self.next_evaluation: Optional[float] = None
+        self.wakeup = threading.Event()
+        self._lock = threading.Lock()
+        self._manual_until: Optional[float] = None
+        self._was_charging = False
+        self._applied = None
+
+    # --- manual override, called from the web thread -------------------
+
+    @property
+    def manual_until(self) -> Optional[float]:
+        """ Epoch seconds a manual charge runs until, None if none. """
+        with self._lock:
+            if self._manual_until is not None and self._manual_until <= time.time():
+                self._manual_until = None
+            return self._manual_until
+
+    def start_manual_charge(self, minutes: int = MANUAL_DEFAULT_MINUTES) -> float:
+        """ Charge at full speed for `minutes`. Returns the end, epoch s. """
+        minutes = max(1, min(int(minutes), MANUAL_MAX_MINUTES))
+        with self._lock:
+            self._manual_until = time.time() + minutes * 60
+            until = self._manual_until
+        logger.info('Manual charge requested for %d min', minutes)
+        self.wakeup.set()
+        return until
+
+    def cancel_manual_charge(self) -> None:
+        """ Stop a manual charge; the rules take over on the next cycle. """
+        with self._lock:
+            self._manual_until = None
+        logger.info('Manual charge cancelled')
+        self.wakeup.set()
+
+    # --- the loop -------------------------------------------------------
+
+    def read_battery(self) -> rules.Battery:
+        """ One reading of the inverter. """
+        return rules.Battery(
+            soc=float(self.inverter.get_SOC()),
+            capacity_wh=float(self.inverter.get_capacity()),
+            min_soc=float(self.inverter.min_soc),
+            max_soc=float(self.inverter.max_soc),
+        )
+
+    def evaluate(self, now: datetime.datetime, battery: rules.Battery,
+                 slots) -> rules.Plan:
+        """ Run the rules with the loop's state. """
+        manual = self.manual_until
+        return rules.plan(
+            now, slots, battery, self.settings,
+            was_charging=self._was_charging,
+            manual_until=(datetime.datetime.fromtimestamp(manual, self.timezone)
+                          if manual else None),
+        )
+
+    def apply(self, plan: rules.Plan) -> None:
+        """ Tell the inverter what the plan says. """
+        if plan.mode == rules.MODE_CHARGE:
+            self.inverter.set_mode_force_charge(int(plan.charge_rate_w))
+        else:
+            self.inverter.set_mode_allow_discharge()
+        applied = (plan.mode, plan.charge_rate_w)
+        if applied != self._applied:
+            logger.info('Mode %s (%s): %s', plan.mode, plan.reason, plan.headline)
+            self._applied = applied
+        self._was_charging = plan.reason == rules.REASON_NIGHT_RESERVE
+
+    def run(self) -> Optional[CycleResult]:
+        """ One evaluation. Skips the cycle when the inverter is unreachable. """
+        now = datetime.datetime.now(self.timezone)
         try:
-            return func(self, *args, **kwargs)
-        except InverterError as e:
-            logger.warning(
-                "Inverter unavailable during '%s', ignoring external request: %s",
-                func.__name__, e,
-            )
+            battery = self.read_battery()
+        except InverterCommunicationError as exc:
+            logger.warning('Skipping cycle, inverter unreachable: %s', exc)
             return None
-    return wrapper
-
-
-class Batcontrol:
-    """ Main class for Batcontrol, handles the logic and control of the battery system """
-    general_logic = None  # type: CommonLogic
-
-    def __init__(self, configdict: dict, data_directory=None):
-        # For API
-        self.api_overwrite = False
-        # -1 = charge from grid, 0 = avoid discharge,
-        # 8 = limit battery charge, 10 = discharge allowed
-        self.last_mode = None
-        self.last_control_source = None
-        self.last_charge_rate = 0
-        self._limit_battery_charge_rate = -1  # Dynamic battery charge rate limit (-1 = no limit)
-        self._evcc_peak_shaving_disabled = False  # Tracks last evcc-disable state for log messages
-        # Runtime state for MQTT and the web API, one frozen object per topic
-        # (see runtime_state.py). The battery values are cached per cycle:
-        # the web thread must never read them from the inverter.
-        self.battery_state = BatteryState()
-        self.calculation_result: Optional[CalculationResult] = None
-        self.solar_metrics: Optional[SolarMetrics] = None
-        self.peak_shaving_state: Optional[PeakShavingState] = None
-        self.configured_parameters: Optional[ConfiguredParameters] = None
-
-        self.discharge_blocked = False
-
-        # External (e.g. HEMS/grid operator, section 14a EnWG) grid-charge lock
-        self._grid_charge_locked = False
-        self._pre_lock_max_charging_from_grid_limit = None
-
-        self.fetched_stored_energy = False
-        self.fetched_reserved_energy = False
-        self.fetched_max_capacity = False
-        self.fetched_soc = False
-        self.fetched_stored_usable_energy = False
-
-        self.last_run_time = 0
-        # Interval between control cycles, exposed for the web API so it can
-        # report when the next evaluation is due.
-        self.evaluation_interval_seconds = TIME_BETWEEN_EVALUATIONS
-        # Immutable forecast snapshot of the last completed cycle, published
-        # as a single atomic attribute assignment for the web API to read.
-        # See web/snapshot.py for why this is not a lock.
-        self.forecast_snapshot = None
-
-        self.last_logic_instance = None
-
-        # Decision history and status change endpoint (see decision_journal.py).
-        # The pending trace carries the steps of the decision that is currently
-        # being applied to __set_mode. It is kept per thread, because the
-        # scheduler and the API/evcc threads change the mode independently.
-        self.decision_journal = DecisionJournal()
-        self._pending = _PendingTrace()
-
-        self.config = configdict
-        config = configdict
-
-        # Extract and validate time resolution (15 or 60 minutes)
-        # Get time resolution from config, convert string to int if needed
-        # (HomeAssistant form fields may provide string values)
-        time_resolution_raw = config.get('time_resolution_minutes', 60)
-        if isinstance(time_resolution_raw, str):
-            self.time_resolution = int(time_resolution_raw)
-        else:
-            self.time_resolution = time_resolution_raw
-
-        if self.time_resolution not in [15, 60]:
-            # Note: Python3.11 had issue with f-strings and multiline. Using format() here.
-            error_message = "time_resolution_minutes must be either " + \
-                "15 (quarter-hourly) or 60 (hourly), " + \
-                " got '%s'.".format(self.time_resolution) + \
-                " Please update your configuration file."
-
-            raise ValueError(error_message)
-
-        self.intervals_per_hour = 60 // self.time_resolution
-        logger.info(
-            'Using %d-minute time resolution (%d intervals per hour)',
-            self.time_resolution,
-            self.intervals_per_hour
-        )
-
+        slots = self.prices.get_slots(now)
+        plan = self.evaluate(now, battery, slots)
+        for note in plan.notes:
+            logger.info('Note: %s', note)
         try:
-            tzstring = config['timezone']
-            self.timezone = pytz.timezone(tzstring)
-        except KeyError:
-            raise RuntimeError(
-                f"Config Entry in general: timezone {config['timezone']} " +
-                "not valid. Try e.g. 'Europe/Berlin'"
-            )
+            self.apply(plan)
+        except InverterCommunicationError as exc:
+            logger.warning('Could not set inverter mode: %s', exc)
+            return None
+        result = CycleResult(
+            evaluated_at=time.time(),
+            battery=battery,
+            slots=tuple(slots),
+            plan=plan,
+        )
+        self.last = result
+        return result
 
+    def shutdown(self) -> None:
+        """ Restore the inverter configuration. """
         try:
-            tz = os.environ['TZ']
-            logger.info("Host system time zone is %s", tz)
-        except KeyError:
-            logger.info(
-                "Host system time zone was not set. Setting to %s",
-                config['timezone']
-            )
-            os.environ['TZ'] = config['timezone']
-
-        # time.tzset() is not available on Windows. When handling timezones
-        # exclusively using pytz this is fine
-        if platform.system() != 'Windows':
-            time.tzset()
-
-        self.dynamic_tariff = tariff_factory.create_tarif_provider(
-            config['utility'],
-            self.timezone,
-            TIME_BETWEEN_UTILITY_API_CALLS,
-            DELAY_EVALUATION_BY_SECONDS,
-            target_resolution=self.time_resolution,
-            nf_cfg=config.get('dynamic_network_fees', {}),
-            persistent_cache_directory=(
-                Path(data_directory) / 'cache' / 'tariff'
-                if data_directory is not None else None
-            ),
-        )
-
-        self.inverter = inverter_factory.create_inverters(
-            config['inverter'])
-
-        self.max_pv_charge_rate, self.min_pv_charge_rate = (
-            self._aggregate_pv_charge_rates(config['inverter'], self.inverter)
-        )
-
-        # Validate min/max PV charge rate configuration at startup
-        if (
-            self.max_pv_charge_rate > 0
-            and self.min_pv_charge_rate > 0
-            and self.min_pv_charge_rate > self.max_pv_charge_rate
-        ):
-            logger.warning(
-                'Configured min_pv_charge_rate (%d W) is greater than '
-                'max_pv_charge_rate (%d W). Adjusting minimum to max.',
-                self.min_pv_charge_rate,
-                self.max_pv_charge_rate,
-            )
-            self.min_pv_charge_rate = self.max_pv_charge_rate
-
-        self.pvsettings = config['pvinstallations']
-        self.fc_solar = solar_factory.create_solar_provider(
-            self.pvsettings,
-            self.timezone,
-            TIME_BETWEEN_UTILITY_API_CALLS,
-            DELAY_EVALUATION_BY_SECONDS,
-            requested_provider=config.get(
-                'solar_forecast_provider', 'fcsolarapi'),
-            target_resolution=self.time_resolution,
-            persistent_cache_directory=(
-                Path(data_directory) / 'cache' / 'solar'
-                if data_directory is not None else None
-            ),
-        )
-
-        self.fc_consumption = consumption_factory.create_consumption(
-            self.timezone,
-            config['consumption_forecast'],
-            target_resolution=self.time_resolution
-        )
-
-        self.batconfig = config['battery_control']
-        self.time_at_forecast_error = -1
-
-        self.peak_shaving_config = PeakShavingConfig.from_config(config)
-        if self.peak_shaving_config.enabled:
-            # Up to 0.10.0 peak shaving only ran with battery_control.type
-            # "next" and was documented as having no effect otherwise, so a
-            # config may carry enabled: true from a time when it did nothing.
-            # It now applies to every logic type -- announce the activation
-            # once at startup instead of leaving it to be inferred from the
-            # per-cycle [PeakShaving] lines.
-            logger.info(
-                'Peak shaving is ENABLED and limits PV charging of the '
-                'battery (active rules: time=%s, price=%s, solar_cap=%s, '
-                'allow_full_battery_after=%d:00). It applies to every '
-                'battery_control.type; up to 0.10.0 it required type '
-                '"next". Set peak_shaving.enabled to false to switch it off.',
-                self.peak_shaving_config.time_active,
-                self.peak_shaving_config.price_active,
-                self.peak_shaving_config.solar_cap_active,
-                self.peak_shaving_config.allow_full_battery_after,
-            )
-        if (self.peak_shaving_config.solar_cap_active
-                and self.peak_shaving_config.feed_in_limit_w > 0
-                and self.max_pv_charge_rate > 0):
-            logger.warning(
-                'peak_shaving.feed_in_limit_w (%.0f W) is configured together '
-                'with a static max_pv_charge_rate (%.0f W): if the solar_cap '
-                'clip absorption needs a higher charge rate than this static '
-                'cap allows, curtailment cannot be fully avoided. Consider '
-                'raising max_pv_charge_rate or removing it.',
-                self.peak_shaving_config.feed_in_limit_w,
-                self.max_pv_charge_rate,
-            )
-
-        self.max_charging_from_grid_limit = self.batconfig.get(
-            'max_charging_from_grid_limit', 0.8)
-        self.min_price_difference = self.batconfig.get(
-            'min_price_difference', 0.05)
-        self.min_price_difference_rel = self.batconfig.get(
-            'min_price_difference_rel', 0)
-        self.min_grid_charge_soc = parse_optional_ratio(
-            self.batconfig.get('min_grid_charge_soc', None),
-            'battery_control.min_grid_charge_soc'
-        )
-        self.grid_charge_target_config = (
-            GridChargeTargetConfig.from_battery_control_config(self.batconfig)
-        )
-        self.grid_charge_target_strategy = self.grid_charge_target_config.strategy
-        self.preserve_min_grid_charge_soc = False
-        if (self.min_grid_charge_soc is not None
-                and self.min_grid_charge_soc > self.max_charging_from_grid_limit):
-            logger.warning(
-                'min_grid_charge_soc (%.2f) is above '
-                'max_charging_from_grid_limit (%.2f); grid charging cannot '
-                'reach the minimum SoC target. Increase '
-                'max_charging_from_grid_limit or lower min_grid_charge_soc.',
-                self.min_grid_charge_soc,
-                self.max_charging_from_grid_limit
-            )
-
-        battery_control_expert = self.config.get(
-            'battery_control_expert', None)
-        if (battery_control_expert is not None
-                and not isinstance(battery_control_expert, dict)):
-            raise ValueError(
-                'battery_control_expert must be a mapping of key: value '
-                f'settings, got {type(battery_control_expert).__name__}'
-            )
-        battery_control_expert = battery_control_expert or {}
-
-        self.round_price_digits = 4
-        self.production_offset_percent = 1.0  # Default: no offset
-        self.market_price_refresh_time = "12:30"
-
-        if battery_control_expert:
-            self.round_price_digits = battery_control_expert.get(
-                'round_price_digits',
-                self.round_price_digits)
-            self.production_offset_percent = battery_control_expert.get(
-                'production_offset_percent',
-                self.production_offset_percent)
-            self.preserve_min_grid_charge_soc = battery_control_expert.get(
-                'preserve_min_grid_charge_soc',
-                self.preserve_min_grid_charge_soc)
-            raw_refresh_time = battery_control_expert.get(
-                'market_price_refresh_time',
-                self.market_price_refresh_time)
-            self._validate_market_price_refresh_time(raw_refresh_time)
-            self.market_price_refresh_time = raw_refresh_time
-
-        # Only parse/validate whichever location will actually be used, so
-        # an invalid deprecated battery_control value never blocks startup
-        # when battery_control_expert (which takes priority) is valid.
-        legacy_present = 'charge_rate_multiplier' in self.batconfig
-        expert_present = 'charge_rate_multiplier' in battery_control_expert
-        if legacy_present:
-            if expert_present:
-                deprecation_note = (
-                    'It is ignored because '
-                    'battery_control_expert.charge_rate_multiplier is '
-                    'also set.'
-                )
-            else:
-                deprecation_note = 'Using it as a fallback for now.'
-            logger.warning(
-                'battery_control.charge_rate_multiplier is deprecated and '
-                'will be removed in a future release; use '
-                'battery_control_expert.charge_rate_multiplier instead. %s',
-                deprecation_note
-            )
-        if expert_present:
-            charge_rate_multiplier = parse_positive_number(
-                battery_control_expert['charge_rate_multiplier'],
-                'battery_control_expert.charge_rate_multiplier'
-            )
-        elif legacy_present:
-            charge_rate_multiplier = parse_positive_number(
-                self.batconfig['charge_rate_multiplier'],
-                'battery_control.charge_rate_multiplier'
-            )
-        else:
-            charge_rate_multiplier = 1.1
-
-        self.general_logic = CommonLogic.get_instance(
-            charge_rate_multiplier=charge_rate_multiplier,
-            always_allow_discharge_limit=self.batconfig.get(
-                'always_allow_discharge_limit', 0.9),
-            max_capacity=self.inverter.get_max_capacity(),
-            min_charge_energy=self.batconfig.get('min_recharge_amount', 100.0)
-        )
-        self.configured_parameters = self.__capture_configured_parameters()
-
-        self.mqtt_api = None
-        if config.get('mqtt', None) is not None:
-            if config.get('mqtt').get('enabled', False):
-                logger.info('MQTT Connection enabled')
-                self.mqtt_api = MqttApi(
-                    config.get('mqtt'),
-                    interval_minutes=self.time_resolution
-                )
-                self.mqtt_api.wait_ready()
-                # The "Decision" sensor follows the status changes of the
-                # decision journal, plus the refreshes that keep the numbers
-                # and the reason in its text current
-                self.decision_journal.add_listener(
-                    self.mqtt_api.publish_status_change, refresh=True)
-                # Register for callbacks
-                self.mqtt_api.register_set_callback(
-                    'mode',
-                    self.api_set_mode,
-                    int
-                )
-                self.mqtt_api.register_set_callback(
-                    'charge_rate',
-                    self.api_set_charge_rate,
-                    int
-                )
-                self.mqtt_api.register_set_callback(
-                    'limit_battery_charge_rate',
-                    self.api_set_limit_battery_charge_rate,
-                    int
-                )
-                self.mqtt_api.register_set_callback(
-                    'always_allow_discharge_limit',
-                    self.api_set_always_allow_discharge_limit,
-                    float
-                )
-                self.mqtt_api.register_set_callback(
-                    'max_charging_from_grid_limit',
-                    self.api_set_max_charging_from_grid_limit,
-                    float
-                )
-                self.mqtt_api.register_set_callback(
-                    'min_price_difference',
-                    self.api_set_min_price_difference,
-                    float
-                )
-                self.mqtt_api.register_set_callback(
-                    'min_price_difference_rel',
-                    self.api_set_min_price_difference_rel,
-                    float
-                )
-                self.mqtt_api.register_set_callback(
-                    'production_offset',
-                    self.api_set_production_offset,
-                    float
-                )
-                self.mqtt_api.register_set_callback(
-                    'peak_shaving/enabled',
-                    self.api_set_peak_shaving_enabled,
-                    str
-                )
-                self.mqtt_api.register_set_callback(
-                    'peak_shaving/allow_full_battery_after',
-                    self.api_set_peak_shaving_allow_full_after,
-                    int
-                )
-                self.mqtt_api.register_set_callback(
-                    'peak_shaving/price_limit',
-                    self.api_set_peak_shaving_price_limit,
-                    float
-                )
-                grid_charge_lock_topic = config.get(
-                    'mqtt').get('grid_charge_lock_topic')
-                if grid_charge_lock_topic:
-                    self.mqtt_api.register_external_topic_callback(
-                        grid_charge_lock_topic,
-                        self.api_set_grid_charge_lock,
-                        parse_bool_flag
-                    )
-                # Inverter Callbacks
-                self.inverter.activate_mqtt(self.mqtt_api)
-
-        self.evcc_api = None
-        if config.get('evcc', None) is not None:
-            if config.get('evcc').get('enabled', False):
-                logger.info('evcc Connection enabled')
-                self.evcc_api = EvccApi(config['evcc'])
-                self.evcc_api.register_block_function(
-                    self.set_discharge_blocked)
-                self.evcc_api.register_always_allow_discharge_limit(
-                    self.set_always_allow_discharge_limit,
-                    self.get_always_allow_discharge_limit
-                )
-                self.evcc_api.register_max_charge_limit(
-                    self.set_max_charging_from_grid_limit,
-                    self.get_max_charging_from_grid_limit
-                )
-                self.evcc_api.start()
-                self.evcc_api.wait_ready()
-                logger.info('evcc Connection ready')
-
-        # Read-only web API, dashboard and MCP server. Started last, so a
-        # failure here cannot stop the control loop from coming up - which
-        # has to include parsing its configuration: a typo in an optional
-        # read-only accessory must not stop the battery being controlled.
-        self.web_server = None
-        try:
-            self.api_config = web_config.from_config(config)
-        except ValueError as exc:
-            logger.error(
-                'Invalid api configuration (%s). The API, dashboard and MCP'
-                ' server stay disabled; battery control continues.', exc)
-            self.api_config = web_config.ApiConfig()
-        if self.api_config.enabled:
-            self.__start_web_api()
-
-        # Initialize scheduler thread
-        self.scheduler = SchedulerThread()
-        logger.info('Scheduler thread initialized')
-        self.scheduler.start()
-        # Schedule periodic checks as fail-safe variant
-        self.scheduler.schedule_every(
-            1, 'hours', self.fc_solar.refresh_data, 'forecast-solar-every')
-        self.scheduler.schedule_every(
-            1,
-            'hours',
-            self.dynamic_tariff.refresh_data,
-            'utility-tariff-every')
-        self.scheduler.schedule_every(
-            2,
-            'hours',
-            self.fc_consumption.refresh_data,
-            'forecast-consumption-every')
-        # Hard refresh at market publish time (default 12:30 UTC) to pick up
-        # newly published next-day prices (e.g. EPEX spot).
-        self.scheduler.schedule_at(
-            self.market_price_refresh_time,
-            self._hard_refresh_prices,
-            'market-price-hard-refresh',
-            tz='UTC'
-        )
-        # Run initial data fetch
-        try:
-            self.fc_solar.refresh_data()
-            self.dynamic_tariff.refresh_data()
-            self.fc_consumption.refresh_data()
-        except Exception as e:
-            logger.error("Error during initial data fetch: %s", e)
-
-    def __start_web_api(self) -> None:
-        """ Bring up the read-only web API, tolerating any failure.
-
-        The API is a reader. If it cannot start - missing dependency, port
-        already in use - batcontrol logs it and carries on controlling the
-        battery.
-        """
-        try:
-            # Imported here so an installation with the API disabled never
-            # imports FastAPI at all.
-            from .web.server import WebServer  # pylint: disable=import-outside-toplevel
-            self.web_server = WebServer(self, self.api_config)
-            if not self.web_server.start():
-                self.web_server = None
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            self.web_server = None
-            logger.error(
-                'Web API could not be started (%s). Battery control continues'
-                ' without it.', exc, exc_info=True)
-
-    def refresh_all_providers(self) -> None:
-        """ Force a refresh of all data providers (triggered by SIGHUP).
-
-        Solar forecast providers still respect their rate limit blackout
-        window. Errors of one provider do not stop the others.
-        """
-        for name, refresh in (
-                ('solar forecast', lambda: self.fc_solar.refresh_data(force=True)),
-                ('dynamic tariff', lambda: self.dynamic_tariff.refresh_data(force=True)),
-                ('consumption forecast', self.fc_consumption.refresh_data)):
-            try:
-                refresh()
-            except Exception as exc:  # pylint: disable=broad-exception-caught
-                logger.error("Refresh of %s failed: %s", name, exc)
-
-    def shutdown(self):
-        """ Shutdown Batcontrol and dependent modules (inverter..) """
-        logger.info('Shutting down Batcontrol')
-        try:
-            # Stop scheduler thread first, then clear jobs.
-            # Clearing before stop() would race with run_pending() in the thread.
-            if hasattr(self, 'scheduler') and self.scheduler is not None:
-                self.scheduler.stop()
-                self.scheduler.clear_jobs()
-                del self.scheduler
-
             self.inverter.shutdown()
-            del self.inverter
-            if self.evcc_api is not None:
-                self.evcc_api.shutdown()
-                del self.evcc_api
-            if self.mqtt_api is not None:
-                self.mqtt_api.shutdown()
-                del self.mqtt_api
-            # getattr, like the scheduler guard above: __init__ can raise
-            # before web_server is assigned, and shutdown() is still called.
-            # An AttributeError here would replace the real startup error in
-            # the log with a misleading one.
-            if getattr(self, 'web_server', None) is not None:
-                self.web_server.shutdown()
-                self.web_server = None
-        except Exception as exc:
-            logger.exception("Error during Batcontrol shutdown: %s", exc)
-
-    @staticmethod
-    def _aggregate_pv_charge_rates(inverter_config, inverter) -> tuple:
-        """ Determine the group-wide PV charge rate limits in W.
-
-        The limits come from the inverter config, falling back to the inverter
-        attribute for backward compatibility. With several inverters the
-        per-inverter limits are summed up, except that a single unlimited
-        inverter (max_pv_charge_rate 0) makes the whole group unlimited,
-        because the total PV charge power cannot be bounded any more.
-
-        Returns:
-            tuple: (max_pv_charge_rate, min_pv_charge_rate) in W.
-        """
-        inverter_configs = (
-            inverter_config if isinstance(inverter_config, list)
-            else [inverter_config]
-        )
-        members = inverter_members(inverter)
-        max_rates = [
-            member_config.get(
-                'max_pv_charge_rate',
-                getattr(member, 'max_pv_charge_rate', 0),
-            )
-            for member_config, member in zip(inverter_configs, members)
-        ]
-        max_pv_charge_rate = 0 if any(
-            rate <= 0 for rate in max_rates) else sum(max_rates)
-        min_pv_charge_rate = sum(
-            member_config.get('min_pv_charge_rate', 0)
-            for member_config in inverter_configs
-        )
-        return max_pv_charge_rate, min_pv_charge_rate
-
-    @staticmethod
-    def _validate_market_price_refresh_time(value: str) -> None:
-        """Raise ValueError if value is not a valid HH:MM time string."""
-        try:
-            datetime.datetime.strptime(value, "%H:%M")
-        except (ValueError, TypeError) as exc:
-            raise ValueError(
-                f"battery_control_expert.market_price_refresh_time must be "
-                f"a valid HH:MM time string (e.g. '12:30'), got: {value!r}"
-            ) from exc
-
-    def _hard_refresh_prices(self) -> None:
-        """Force a price refresh regardless of cache state.
-
-        Called at market_price_refresh_time (UTC) to pick up newly published
-        dynamic tariff data (e.g. EPEX next-day prices published ~12:00 UTC).
-        """
-        logger.info(
-            'Hard price refresh at %s UTC - fetching fresh market prices',
-            self.market_price_refresh_time
-        )
-        self.dynamic_tariff.refresh_data(force=True)
-
-    def __capture_configured_parameters(self) -> ConfiguredParameters:
-        """ Snapshot of the runtime-adjustable parameters as configured.
-
-        Taken once at startup, before MQTT, evcc or the grid charge lock can
-        change anything, so the API can report which values are overridden.
-        """
-        return ConfiguredParameters(
-            min_price_difference=self.min_price_difference,
-            min_price_difference_rel=self.min_price_difference_rel,
-            always_allow_discharge_limit=(
-                self.general_logic.get_always_allow_discharge_limit()),
-            max_charging_from_grid_limit=self.max_charging_from_grid_limit,
-            production_offset_percent=self.production_offset_percent,
-            peak_shaving_enabled=self.peak_shaving_config.enabled,
-            peak_shaving_allow_full_battery_after=(
-                self.peak_shaving_config.allow_full_battery_after),
-            peak_shaving_price_limit=self.peak_shaving_config.price_limit,
-        )
-
-    def reset_forecast_error(self):
-        """ Reset the forecast error timer """
-        self.time_at_forecast_error = -1
-
-    def handle_forecast_error(self):
-        """ Handle forecast errors and fallback to discharging """
-        error_ts = time.time()
-
-        # set time_at_forecast_error if it is at the default value of -1
-        if self.time_at_forecast_error == -1:
-            self.time_at_forecast_error = error_ts
-
-        # get time delta since error
-        time_passed = error_ts - self.time_at_forecast_error
-
-        if time_passed < ERROR_IGNORE_TIME:
-            # keep current mode
-            logger.info("An API Error occurred %0.fs ago. "
-                        "Keeping inverter mode unchanged.", time_passed)
-        else:
-            # set default mode
-            logger.warning(
-                "An API Error occurred %0.fs ago. "
-                "Setting inverter to default mode (Allow Discharging)",
-                time_passed)
-            with self.__override_scope(Reason.FORECAST_ERROR_FALLBACK,
-                                       seconds_since_error=int(time_passed)):
-                self.allow_discharging()
-
-    def run(self):
-        """One control cycle. Aborts cleanly on a transient inverter outage.
-
-        Communication failures are turned into InverterCommunicationError by
-        the resilient wrapper. We skip the cycle and let the scheduler retry on
-        the next run - no decision is made on stale data. A permanent outage
-        surfaces as InverterOutageError, which propagates to terminate.
-        """
-        try:
-            self._run_once()
-        except InverterCommunicationError as e:
-            logger.warning(
-                "Inverter unreachable this cycle (%s). "
-                "Skipping control cycle, will retry on next run.", e
-            )
-
-    def _run_once(self):
-        """ Main calculation & control loop """
-        logger.debug('Timeslots are in %d-minute intervals', self.time_resolution)
-
-        # Reset some values
-        self.__reset_run_data()
-
-        # Verify some constraints:
-        #   always_allow_discharge needs to be above max_charging from grid.
-        #   if not, it will oscillate between discharging and charging.
-        always_allow_discharge_limit = self.general_logic.get_always_allow_discharge_limit()
-        if always_allow_discharge_limit < self.max_charging_from_grid_limit:
-            logger.warning("Always_allow_discharge_limit (%.2f) is"
-                           " below max_charging_from_grid_limit (%.2f)",
-                           always_allow_discharge_limit,
-                           self.max_charging_from_grid_limit
-                           )
-            self.max_charging_from_grid_limit = always_allow_discharge_limit - 0.01
-            logger.warning("Lowering max_charging_from_grid_limit to %.2f",
-                           self.max_charging_from_grid_limit)
-
-        # for API
-        self.refresh_static_values()
-        self.set_discharge_limit(
-            self.get_max_capacity() * always_allow_discharge_limit
-        )
-        self.last_run_time = time.time()
-
-        # get forecasts
-        try:
-            price_dict = self.dynamic_tariff.get_prices()
-            production_forecast = self.fc_solar.get_forecast()
-            # harmonize forecast horizon
-            # fc_period is a slot index at self.time_resolution, so the
-            # consumption forecast is requested in the same unit.
-            fc_period = min(max(price_dict.keys()),
-                            max(production_forecast.keys()))
-            requested_slots = fc_period + 1
-            consumption_forecast = self.fc_consumption.get_forecast(
-                requested_slots)
-            if len(consumption_forecast) < requested_slots:
-                # A shorter consumption forecast reduces the forecast horizon,
-                # like it does for prices and production
-                if len(consumption_forecast) < MIN_FORECAST_HOURS:
-                    # Note: string formatting to avoid f-string multiline issues in <=Python3.11
-                    raise RuntimeError(
-                        "Not enough consumption forecast data available, requested %d, got %d" % (
-                            fc_period, len(consumption_forecast)))
-                logger.warning(
-                    "Insufficient consumption forecast data available, reducing "
-                    "forecast to %d slots", len(consumption_forecast))
-                fc_period = len(consumption_forecast) - 1
-        except Exception as e:
-            logger.warning(
-                'Following Exception occurred when trying to get forecasts: %s',
-                e,
-                exc_info=True)
-            self.handle_forecast_error()
-            return
-
-        self.reset_forecast_error()
-
-        # initialize arrays
-
-        production = np.zeros(fc_period + 1)
-        consumption = np.zeros(fc_period + 1)
-        prices = np.zeros(fc_period + 1)
-
-        for h in range(fc_period + 1):
-            production[h] = production_forecast[h] * \
-                self.production_offset_percent
-            consumption[h] = consumption_forecast[h]
-            prices[h] = round(price_dict[h], self.round_price_digits)
-
-        net_consumption = consumption - production
-
-        # Log if production offset is active
-        if self.production_offset_percent != 1.0:
-            logger.info('Production offset active: %.1f%% (multiplier: %.3f)',
-                        self.production_offset_percent * 100,
-                        self.production_offset_percent)
-
-        # Format arrays consistently for logging (suppress scientific notation)
-        with np.printoptions(suppress=True):
-            logger.debug('Production Forecast: %s',
-                         production.round(1))
-            logger.debug('Consumption Forecast: %s',
-                         consumption.round(1))
-            logger.debug('Net Consumption Forecast: %s',
-                         net_consumption.round(1))
-            logger.debug('Prices: %s',
-                         prices.round(self.round_price_digits))
-        # negative = charging or feed in
-        # positive = dis-charging or grid consumption
-
-        # Store data for API
-        self.__save_run_data(production, consumption, net_consumption, prices)
-
-        # stop here if api_overwrite is set and reset it
-        if self.api_overwrite:
-            logger.info(
-                'API Overwrite active. Skipping control logic. '
-                'Next evaluation in %.0f seconds',
-                TIME_BETWEEN_EVALUATIONS
-            )
-            self.api_overwrite = False
-            if self.mqtt_api is not None:
-                self.mqtt_api.publish_api_override_active(False)
-            return
-
-        # Correction for time that has already passed in the current interval
-        # Note: With Full-Hour Alignment, providers return data where [0] is already
-        # the current interval (e.g., at 10:20, [0] represents 10:15-10:30 for 15-min)
-        # We factorize based on elapsed time WITHIN the current interval
-        now = datetime.datetime.now().astimezone(self.timezone)
-        current_minute = now.minute
-        current_second = now.second
-
-        # Get interval resolution from config (default to 60 for backward
-        # compatibility)
-        interval_minutes = self.time_resolution
-
-        # Calculate elapsed time in the CURRENT interval as a fraction
-        # For 15-min: at 10:20:30, current_minute=20, we're in interval 10:15-10:30
-        #   elapsed = (20 % 15 + 30/60) / 15 = (5 + 0.5) / 15 = 0.367
-        # For 60-min: at 10:20:30, current_minute=20, we're in interval 10:00-11:00
-        #   elapsed = (20 + 30/60) / 60 = 20.5 / 60 = 0.342
-        elapsed_in_current = (current_minute % interval_minutes +
-                              current_second / 60) / interval_minutes
-
-        # Factorize [0] to account for elapsed time
-        production[0] *= (1 - elapsed_in_current)
-        consumption[0] *= (1 - elapsed_in_current)
-        net_consumption = consumption - production
-
-        logger.debug(
-            'Current interval factorization: elapsed=%.3f, remaining=%.3f',
-            elapsed_in_current,
-            1 - elapsed_in_current
-        )
-
-        this_logic_run = LogicFactory.create_logic(self.time_resolution,
-                                                   self.config,
-                                                   self.timezone)
-
-        # Create input for calculation
-        calc_input = CalculationInput(
-            production,
-            consumption,
-            prices,
-            self.get_stored_energy(),
-            self.get_stored_usable_energy(),
-            self.get_free_capacity()
-        )
-        peak_shaving_config_enabled = self.peak_shaving_config.enabled
-
-        # Determine whether evcc conditions require peak shaving to be disabled.
-        # This must happen before building calc_parameters so the logic never
-        # runs peak shaving unnecessarily. Initialized unconditionally to avoid
-        # an UnboundLocalError if peak shaving is disabled in config.
-        evcc_disable_peak_shaving = False
-        evcc_reason = None
-        decision_trace = self.__new_trace()
-        if peak_shaving_config_enabled:
-            if self.evcc_api is not None:
-                evcc_disable_peak_shaving = (
-                    self.evcc_api.evcc_is_charging or
-                    self.evcc_api.evcc_ev_expects_pv_surplus
-                )
-                if evcc_disable_peak_shaving:
-                    if self.evcc_api.evcc_is_charging:
-                        logger.debug('[PeakShaving] Disabled: evcc is actively charging')
-                        evcc_reason = Reason.EVCC_CHARGING
-                    else:
-                        logger.debug('[PeakShaving] Disabled: EV connected in PV mode')
-                        evcc_reason = Reason.EVCC_EV_EXPECTS_PV_SURPLUS
-                    decision_trace.step(Decision.PEAK_SHAVING, Outcome.SKIPPED,
-                                        evcc_reason)
-                elif self._evcc_peak_shaving_disabled:
-                    logger.debug('[PeakShaving] Re-enabled: evcc no longer blocking '
-                                '(EV disconnected or mode changed away from pv)')
-                self._evcc_peak_shaving_disabled = evcc_disable_peak_shaving
-        else:
-            # Reset tracking flag when peak shaving is disabled in config.
-            self._evcc_peak_shaving_disabled = False
-
-        # evcc may force peak shaving off for a single cycle; the underlying
-        # peak_shaving_config is left untouched.
-        ps_runtime = dataclasses.replace(
-            self.peak_shaving_config,
-            enabled=peak_shaving_config_enabled and not evcc_disable_peak_shaving,
-        )
-        max_capacity = self.get_max_capacity()
-        calc_parameters = CalculationParameters(
-            self.max_charging_from_grid_limit,
-            self.min_price_difference,
-            self.min_price_difference_rel,
-            max_capacity,
-            min_grid_charge_soc=self.min_grid_charge_soc,
-            preserve_min_grid_charge_soc=self.preserve_min_grid_charge_soc,
-            peak_shaving=ps_runtime,
-            grid_charge_target=self.grid_charge_target_config,
-        )
-
-        self.last_logic_instance = this_logic_run
-        this_logic_run.set_calculation_parameters(calc_parameters)
-        # Calculate inverter mode
-        logger.debug('Calculating inverter mode...')
-        if not this_logic_run.calculate(calc_input):
-            logger.error('Calculation failed. Falling back to discharge')
-            with self.__override_scope(Reason.CALCULATION_FAILED,
-                                       trace=decision_trace):
-                self.allow_discharging()
-            return
-
-        decision_trace.extend(this_logic_run.get_decision_trace())
-        calc_output = this_logic_run.get_calculation_output()
-        inverter_settings = this_logic_run.get_inverter_control_settings()
-
-        self.__store_calculation_result(calc_output)
-        self.__store_solar_metrics(
-            production, consumption, net_consumption, calc_input)
-
-        if self.discharge_blocked and not \
-                self.general_logic.is_discharge_always_allowed_soc(self.get_SOC()):
-            # We are blocked by a request outside control loop (evcc)
-            # but only if the always_allow_discharge_limit is not reached.
-            logger.debug('Discharge blocked due to external lock')
-            if inverter_settings.allow_discharge:
-                decision_trace.step(
-                    Decision.OVERRIDE, Outcome.APPLIED,
-                    Reason.EXTERNAL_DISCHARGE_BLOCK, decisive=True)
-            inverter_settings.allow_discharge = False
-
-        # Peak shaving charge limit (after evcc guard may have cleared it)
-        self.__store_peak_shaving_state(
-            peak_shaving_config_enabled, evcc_reason, decision_trace,
-            inverter_settings.limit_battery_charge_rate)
-
-        with self.__decision_scope(decision_trace):
-            if inverter_settings.allow_discharge:
-                if inverter_settings.limit_battery_charge_rate >= 0:
-                    self.limit_battery_charge_rate(
-                        inverter_settings.limit_battery_charge_rate)
-                else:
-                    self.allow_discharging()
-            elif inverter_settings.charge_from_grid:
-                self.force_charge(inverter_settings.charge_rate)
-            else:
-                self.avoid_discharging()
-
-    def __store_calculation_result(self, calc_output) -> None:
-        """ Keep the logic's per-cycle results and publish them. """
-        reserved_effective = cap_reserved_energy(
-            calc_output.reserved_energy, self.battery_state,
-            self.general_logic.get_always_allow_discharge_limit())
-        self.calculation_result = CalculationResult(
-            reserved_energy=calc_output.reserved_energy,
-            reserved_energy_effective=reserved_effective,
-            min_dynamic_price_difference=(
-                calc_output.min_dynamic_price_difference),
-            effective_min_grid_charge_soc=(
-                calc_output.effective_min_grid_charge_soc),
-        )
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_reserved_energy_capacity(
-                calc_output.reserved_energy)
-            self.mqtt_api.publish_reserved_energy_capacity_effective(
-                reserved_effective)
-            self.mqtt_api.publish_min_dynamic_price_diff(
-                calc_output.min_dynamic_price_difference)
-            if calc_output.effective_min_grid_charge_soc is not None:
-                self.mqtt_api.publish_effective_min_grid_charge_soc(
-                    calc_output.effective_min_grid_charge_soc)
-
-    def __store_solar_metrics(self, production, consumption,
-                              net_consumption, calc_input) -> None:
-        """ Derive the forecast indicators and publish them. """
-        solar_active, surplus_wh = ForecastMetrics.solar_active_and_surplus(
-            production, consumption, calc_input.free_capacity
-        )
-        metrics = SolarMetrics(
-            solar_active=bool(solar_active),
-            solar_surplus_wh=float(surplus_wh),
-            pv_start_battery_wh=float(ForecastMetrics.pv_start_battery(
-                net_consumption,
-                calc_input.stored_usable_energy, calc_input.free_capacity
-            )),
-            forecast_min_battery_wh=float(ForecastMetrics.forecast_min_battery(
-                net_consumption,
-                calc_input.stored_usable_energy, calc_input.free_capacity
-            )),
-        )
-        self.solar_metrics = metrics
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_solar_active(metrics.solar_active)
-            self.mqtt_api.publish_solar_surplus(metrics.solar_surplus_wh)
-            self.mqtt_api.publish_pv_start_battery(metrics.pv_start_battery_wh)
-            self.mqtt_api.publish_forecast_min_battery(
-                metrics.forecast_min_battery_wh)
-
-    def __store_peak_shaving_state(self, config_enabled: bool,
-                                   suspended_by: Optional[str],
-                                   trace: DecisionTrace,
-                                   charge_limit: int) -> None:
-        """ Keep what peak shaving did this cycle and publish the limit. """
-        def last_record(decision):
-            for record in reversed(trace.records):
-                if record.decision == decision:
-                    return record
-            return None
-
-        peak_record = last_record(Decision.PEAK_SHAVING)
-        solar_record = last_record(Decision.SOLAR_LIMIT)
-        self.peak_shaving_state = PeakShavingState(
-            enabled=bool(config_enabled),
-            active=bool(config_enabled) and suspended_by is None,
-            suspended_by=suspended_by if config_enabled else None,
-            charge_limit_w=int(charge_limit) if config_enabled else -1,
-            outcome=peak_record.outcome if peak_record else None,
-            reason=peak_record.reason if peak_record else None,
-            solar_limit_outcome=solar_record.outcome if solar_record else None,
-            solar_limit_reason=solar_record.reason if solar_record else None,
-        )
-        if self.mqtt_api is not None and config_enabled:
-            self.mqtt_api.publish_peak_shaving_charge_limit(charge_limit)
-
-    def __set_charge_rate(self, charge_rate: int):
-        """ Set charge rate and publish to mqtt """
-        self.last_charge_rate = charge_rate
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_charge_rate(charge_rate)
-
-    def __set_control_source(self, control_source: str):
-        """Set the source that last selected the current control state."""
-        if self.last_control_source == control_source:
-            return
-        self.last_control_source = control_source
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_control_source(control_source)
-
-    def __new_trace(self) -> DecisionTrace:
-        """ Start the decision trace of a new control decision """
-        return DecisionTrace(
-            timestamp=datetime.datetime.now().astimezone(self.timezone))
-
-    @contextlib.contextmanager
-    def __decision_scope(self, trace: DecisionTrace):
-        """ Hand the trace to the mode change happening inside the block.
-            Mode changes outside of such a block (API requests) get a trace
-            of their own, see __commit_decision. """
-        self._pending.trace = trace
-        try:
-            yield
-        finally:
-            self._pending.trace = None
-
-    def __override_scope(self, reason: str, *,
-                         trace: Optional[DecisionTrace] = None, **inputs):
-        """ Decision scope for a mode change forced from outside the logic.
-            Adds the override step to trace, or to a new one. """
-        if trace is None:
-            trace = self.__new_trace()
-        trace.step(Decision.OVERRIDE, Outcome.APPLIED, reason,
-                   decisive=True, **inputs)
-        return self.__decision_scope(trace)
-
-    def __record_clamp(self, reason: str, requested: float, applied: float,
-                       **extra) -> None:
-        """ Record that a core-level hardware/config clamp (e.g.
-            max_pv_charge_rate, max_grid_charge_rate) changed the value the
-            logic decided -- so the trace's "why" matches what was
-            actually applied, instead of the logic's pre-clamp number
-            silently drifting from the mode record's value. The clamp is
-            recorded as a note, not as a decisive step: it adjusts the
-            value, but the reason for the mode stays with the logic's step
-            and the clamp is appended to its explanation (see
-            DecisionTrace.explanation). A no-op if there is no pending
-            trace to add to (e.g. a direct API call with no decision scope
-            open) or if the clamp did not change anything. """
-        if self._pending.trace is None or applied == requested:
-            return
-        self._pending.trace.step(
-            Decision.OVERRIDE, Outcome.APPLIED, reason,
-            requested_w=requested, applied_w=applied, **extra)
-
-    def __commit_decision(self, mode, control_source: str, value):
-        """ Complete the trace with the final mode and hand it to the journal,
-            which notifies the status change listeners. """
-        trace = self._pending.trace
-        self._pending.trace = None
-        if trace is None:
-            trace = self.__new_trace()
-            trace.step(
-                Decision.OVERRIDE, Outcome.APPLIED,
-                Reason.API_REQUEST if control_source == CONTROL_SOURCE_API
-                else Reason.UNSPECIFIED,
-                decisive=True)
-        decided_by = trace.decisive_record()
-        # Start from decided_by's own inputs, so the mode record's reason
-        # (borrowed from decided_by) can render its own explanation()
-        # correctly -- without them, e.g. ALWAYS_ALLOW_DISCHARGE_LIMIT's
-        # {stored_energy} placeholder has nothing to format, which used to
-        # fall back silently (logged at DEBUG) on every status change.
-        # The mode-specific keys are applied last so they always win over
-        # anything of the same name in decided_by's inputs.
-        mode_inputs = dict(decided_by.inputs) if decided_by else {}
-        mode_inputs.update(
-            mode=mode,
-            control_source=control_source,
-            decided_by=decided_by.decision if decided_by else None,
-            value=value)
-        trace.add(DecisionRecord(
-            decision=Decision.MODE,
-            outcome=MODE_NAMES.get(mode, str(mode)),
-            reason=decided_by.reason if decided_by else Reason.UNSPECIFIED,
-            inputs=mode_inputs,
-        ))
-        trace.log_full_trace(logger)
-        self.decision_journal.commit(trace, mode, control_source, value)
-
-    def __set_mode(self, mode, control_source: str = CONTROL_SOURCE_OPTIMIZER,
-                   value=None):
-        """ Set mode and publish to mqtt.
-            value is the value belonging to the mode (charge rate of force
-            charge, PV limit of the limit mode) for the decision journal. """
-        self.last_mode = mode
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_mode(mode)
-        self.__set_control_source(control_source)
-        # leaving force charge mode, reset charge rate
-        if self.last_charge_rate > 0 and mode != MODE_FORCE_CHARGING:
-            self.__set_charge_rate(0)
-        self.__commit_decision(mode, control_source, value)
-
-    def allow_discharging(self, control_source: str = CONTROL_SOURCE_OPTIMIZER):
-        """ Allow unlimited discharging of the battery """
-        logger.info('Mode: Allow Discharging')
-        self.inverter.set_mode_allow_discharge()
-        self.__set_mode(MODE_ALLOW_DISCHARGING, control_source)
-
-    def avoid_discharging(self, control_source: str = CONTROL_SOURCE_OPTIMIZER):
-        """ Avoid discharging the battery """
-        logger.info('Mode: Avoid Discharging')
-        self.inverter.set_mode_avoid_discharge()
-        self.__set_mode(MODE_AVOID_DISCHARGING, control_source)
-
-    def force_charge(
-            self,
-            charge_rate=500,
-            control_source: str = CONTROL_SOURCE_OPTIMIZER):
-        """ Force the battery to charge with a given rate """
-        requested_charge_rate = charge_rate
-        charge_rate = int(min(charge_rate, self.inverter.max_grid_charge_rate))
-        self.__record_clamp(
-            Reason.GRID_CHARGE_RATE_CLAMPED, requested_charge_rate, charge_rate,
-            max_grid_charge_rate=self.inverter.max_grid_charge_rate)
-        logger.info(
-            'Mode: grid charging. Charge rate : %d W', charge_rate)
-        self.inverter.set_mode_force_charge(charge_rate)
-        self.__set_mode(MODE_FORCE_CHARGING, control_source, charge_rate)
-        self.__set_charge_rate(charge_rate)
-
-    def limit_battery_charge_rate(
-            self,
-            limit_charge_rate: int = 0,
-            control_source: str = CONTROL_SOURCE_OPTIMIZER):
-        """ Limit PV charging rate while allowing battery discharge
-
-        Args:
-            limit_charge_rate: Maximum charge rate in W (0 = no charging, -1 = no limit)
-        """
-        # If -1, use no limit (don't apply mode 8)
-        if limit_charge_rate < 0:
-            self.allow_discharging(control_source)
-            return
-
-        # Always enforce a non-negative limit
-        requested_limit = limit_charge_rate
-        effective_limit = max(0, limit_charge_rate)
-
-        if self.max_pv_charge_rate > 0:
-            # Cap to the configured maximum
-            effective_limit = min(effective_limit, self.max_pv_charge_rate)
-            # Enforce minimum (guaranteed <= max_pv_charge_rate from init validation)
-            if self.min_pv_charge_rate > 0 and effective_limit > 0:
-                effective_limit = max(effective_limit, self.min_pv_charge_rate)
-        else:
-            # No max configured (<= 0): only enforce minimum if both are positive
-            if self.min_pv_charge_rate > 0 and effective_limit > 0:
-                effective_limit = max(effective_limit, self.min_pv_charge_rate)
-
-        self.__record_clamp(
-            Reason.PV_CHARGE_RATE_CLAMPED, requested_limit, effective_limit,
-            max_pv_charge_rate=self.max_pv_charge_rate,
-            min_pv_charge_rate=self.min_pv_charge_rate)
-
-        logger.info('Mode: Limit Battery Charge Rate to %d W, discharge allowed', effective_limit)
-        self.inverter.set_mode_limit_battery_charge(effective_limit)
-        self.__set_mode(MODE_LIMIT_BATTERY_CHARGE_RATE, control_source,
-                        effective_limit)
-
-        # Publish limit via MQTT
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_limit_battery_charge_rate(effective_limit)
-
-    def __save_run_data(
-            self,
-            production,
-            consumption,
-            net_consumption,
-            prices):
-        """ Save data for API """
-        # One atomic assignment, so a web request never mixes two cycles.
-        self.forecast_snapshot = ForecastSnapshot.build(
-            run_time=self.last_run_time,
-            interval_minutes=self.time_resolution,
-            prices=prices,
-            consumption=consumption,
-            production=production,
-            net_consumption=net_consumption,
-        )
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_production(production, self.last_run_time)
-            self.mqtt_api.publish_consumption(consumption, self.last_run_time)
-            self.mqtt_api.publish_net_consumption(
-                net_consumption, self.last_run_time)
-            self.mqtt_api.publish_prices(prices, self.last_run_time)
-
-    def __reset_run_data(self):
-        """ Reset value Cache """
-        self.fetched_soc = False
-        self.fetched_max_capacity = False
-        self.fetched_stored_energy = False
-        self.fetched_reserved_energy = False
-        self.fetched_stored_usable_energy = False
-
-    def get_SOC(self) -> float:  # pylint: disable=invalid-name
-        """ Returns the SOC in % (0-100) , collects data from inverter """
-        if not self.fetched_soc:
-            self.battery_state = self.battery_state.update(
-                soc=self.inverter.get_SOC())
-            self.fetched_soc = True
-        return self.battery_state.soc
-
-    def get_max_capacity(self) -> float:
-        """ Returns capacity Wh of all batteries reduced by MAX_SOC """
-        if not self.fetched_max_capacity:
-            self.battery_state = self.battery_state.update(
-                max_capacity=self.inverter.get_max_capacity())
-            self.fetched_max_capacity = True
-            if self.mqtt_api is not None:
-                self.mqtt_api.publish_max_energy_capacity(
-                    self.battery_state.max_capacity)
-                self.mqtt_api.publish_gross_energy_capacity(
-                    self.battery_state.gross_capacity)
-        return self.battery_state.max_capacity
-
-    def get_stored_energy(self) -> float:
-        """ Returns the stored eneregy in the battery in kWh without
-            considering the minimum SOC"""
-        if not self.fetched_stored_energy:
-            self.set_stored_energy(self.inverter.get_stored_energy())
-            self.fetched_stored_energy = True
-        return self.battery_state.stored_energy
-
-    def get_stored_usable_energy(self) -> float:
-        """ Returns the stored eneregy in the battery in kWh with considering
-            the MIN_SOC of inverters. """
-        if not self.fetched_stored_usable_energy:
-            self.set_stored_usable_energy(
-                self.inverter.get_stored_usable_energy())
-            self.fetched_stored_usable_energy = True
-        return self.battery_state.stored_usable_energy
-
-    def get_free_capacity(self) -> float:
-        """ Returns the free capacity in Wh that is usable for (dis)charging """
-        self.battery_state = self.battery_state.update(
-            free_capacity=self.inverter.get_free_capacity())
-        return self.battery_state.free_capacity
-
-    def get_reserved_energy(self) -> float:
-        """ Returns the reserved energy in Wh from last calculation """
-        if self.calculation_result is None:
-            return -1
-        return self.calculation_result.reserved_energy
-
-    def set_stored_energy(self, stored_energy) -> None:
-        """ Set the stored energy in Wh """
-        self.battery_state = self.battery_state.update(
-            stored_energy=stored_energy)
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_stored_energy_capacity(stored_energy)
-
-    def set_stored_usable_energy(self, stored_usable_energy) -> None:
-        """ Saves the stored usable energy for API
-            This is the energy that can be used for discharging. This takes
-            account of MIN_SOC and MAX_SOC.
-        """
-        self.battery_state = self.battery_state.update(
-            stored_usable_energy=stored_usable_energy)
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_stored_usable_energy_capacity(
-                stored_usable_energy)
-
-    def set_discharge_limit(self, discharge_limit) -> None:
-        """ Sets the always_allow_discharge_limit and publishes it to the API.
-            This is the value in Wh.
-        """
-        self.battery_state = self.battery_state.update(
-            always_allow_discharge_limit_capacity=discharge_limit)
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_always_allow_discharge_limit_capacity(
-                discharge_limit)
-
-    def set_always_allow_discharge_limit(
-            self, always_allow_discharge_limit: float) -> None:
-        """ Set the always allow discharge limit for battery control """
-        self.general_logic.set_always_allow_discharge_limit(
-            always_allow_discharge_limit)
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_always_allow_discharge_limit(
-                always_allow_discharge_limit)
-
-    def get_always_allow_discharge_limit(self) -> float:
-        """ Get the always allow discharge limit for battery control """
-        return self.general_logic.get_always_allow_discharge_limit()
-
-    def set_max_charging_from_grid_limit(self, limit: float) -> None:
-        """ Set the max charging from grid limit for battery control """
-        # tbh , we should raise an exception here.
-        if limit > self.get_always_allow_discharge_limit():
-            logger.error(
-                'Max charging from grid limit %.2f is '
-                'above always_allow_discharge_limit %.2f',
-                limit,
-                self.get_always_allow_discharge_limit()
-            )
-            return
-        self.max_charging_from_grid_limit = limit
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_max_charging_from_grid_limit(limit)
-
-    def get_max_charging_from_grid_limit(self) -> float:
-        """ Get the max charging from grid limit for battery control """
-        return self.max_charging_from_grid_limit
-
-    @_tolerate_inverter_outage
-    def set_discharge_blocked(self, discharge_blocked) -> None:
-        """ Avoid discharging if an external block is received,
-            but take care of the always_allow_discharge_limit.
-
-            If block is removed, the next calculation cycle will
-            decide what to do.
-        """
-        if discharge_blocked == self.discharge_blocked:
-            return
-        logger.info('Discharge block: %s', {discharge_blocked})
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_discharge_blocked(discharge_blocked)
-        self.discharge_blocked = discharge_blocked
-
-        if not self.general_logic.is_discharge_always_allowed_soc(
-            self.get_SOC()
-        ):
-            with self.__override_scope(
-                    Reason.EXTERNAL_DISCHARGE_BLOCK if discharge_blocked
-                    else Reason.EXTERNAL_DISCHARGE_UNBLOCK):
-                self.avoid_discharging()
-
-    def refresh_static_values(self) -> None:
-        """ Refresh static and some dynamic values for API.
-            Collected data is stored, that it is not fetched again.
-
-            The values are refreshed regardless of which APIs are enabled.
-            They used to be fetched inside the MQTT branch below, which left
-            the SoC on its -1 sentinel whenever MQTT was disabled - the
-            value is cached core state, not an MQTT detail, and the REST API
-            and the dashboard read the same cache.
-        """
-        soc = self.get_SOC()
-        stored_energy = self.get_stored_energy()
-        always_allow_discharge_limit = self.get_always_allow_discharge_limit()
-        # Inverter SoC limits in percent, cached here for the web API: an
-        # InverterGroup derives them from every member's capacity, which can
-        # mean inverter traffic, so the web thread must not read them.
-        self.battery_state = self.battery_state.update(
-            min_soc=as_number(getattr(self.inverter, 'min_soc', None)),
-            max_soc=as_number(getattr(self.inverter, 'max_soc', None)))
-
-        # Per-inverter values (InverterBaseclass.refresh_api_values): every
-        # inverter caches them for the web API and publishes them to MQTT.
-        # Skipped when nobody reads them, because it reads the inverters.
-        if (self.mqtt_api is not None
-                or getattr(self, 'web_server', None) is not None):
-            self.inverter.refresh_api_values()
-
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_SOC(soc)
-            self.mqtt_api.publish_stored_energy_capacity(stored_energy)
-            #
-            self.mqtt_api.publish_always_allow_discharge_limit(
-                always_allow_discharge_limit)
-            self.mqtt_api.publish_max_charging_from_grid_limit(
-                self.max_charging_from_grid_limit)
-            if self.min_grid_charge_soc is not None:
-                self.mqtt_api.publish_min_grid_charge_soc(
-                    self.min_grid_charge_soc)
-            #
-            self.mqtt_api.publish_min_price_difference(
-                self.min_price_difference)
-            self.mqtt_api.publish_min_price_difference_rel(
-                self.min_price_difference_rel)
-            self.mqtt_api.publish_production_offset(
-                self.production_offset_percent)
-            if self.last_mode is not None:
-                self.mqtt_api.publish_mode(self.last_mode)
-            # like the mode, so a status change that happened while the
-            # broker was unreachable reaches the Decision sensor later
-            last_event = self.decision_journal.last_event()
-            if last_event is not None:
-                self.mqtt_api.publish_status_change(last_event)
-            self.mqtt_api.publish_charge_rate(self.last_charge_rate)
-            self.mqtt_api.publish_limit_battery_charge_rate(
-                self._limit_battery_charge_rate)
-            self.mqtt_api.publish_api_override_active(
-                self.api_overwrite)
-            #
-            self.mqtt_api.publish_evaluation_intervall(
-                TIME_BETWEEN_EVALUATIONS)
-            self.mqtt_api.publish_last_evaluation_time(self.last_run_time)
-            #
-            self.mqtt_api.publish_discharge_blocked(self.discharge_blocked)
-            self.mqtt_api.publish_grid_charge_locked(self._grid_charge_locked)
-            # Peak shaving
-            self.mqtt_api.publish_peak_shaving_enabled(
-                self.peak_shaving_config.enabled)
-            self.mqtt_api.publish_peak_shaving_allow_full_after(
-                self.peak_shaving_config.allow_full_battery_after)
-            self.mqtt_api.publish_peak_shaving_price_limit(
-                self.peak_shaving_config.price_limit)
-
-    @_tolerate_inverter_outage
-    def api_set_mode(self, mode: int):
-        """ Log and change config run mode of inverter(s) from external call """
-        # Check if mode is valid
-        if mode not in [
-                MODE_FORCE_CHARGING,
-                MODE_AVOID_DISCHARGING,
-                MODE_LIMIT_BATTERY_CHARGE_RATE,
-                MODE_ALLOW_DISCHARGING]:
-            logger.warning('API: Invalid mode %s', mode)
-            return
-
-        logger.info('API: Setting mode to %s', mode)
-        self.api_overwrite = True
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_api_override_active(True)
-
-        if mode != self.last_mode:
-            # requested_mode shows the request if it ends up in another mode
-            # (mode 8 without a limit falls back to allow discharging)
-            with self.__override_scope(Reason.API_REQUEST, requested_mode=mode):
-                if mode == MODE_FORCE_CHARGING:
-                    self.force_charge(control_source=CONTROL_SOURCE_API)
-                elif mode == MODE_AVOID_DISCHARGING:
-                    self.avoid_discharging(CONTROL_SOURCE_API)
-                elif mode == MODE_LIMIT_BATTERY_CHARGE_RATE:
-                    if self._limit_battery_charge_rate < 0:
-                        logger.warning(
-                            'API: Mode %d (limit battery charge rate) set but no valid '
-                            'limit configured. Set a limit via api_set_limit_battery_charge_rate '
-                            'first. Falling back to allow-discharging mode.',
-                            mode)
-                    self.limit_battery_charge_rate(
-                        self._limit_battery_charge_rate,
-                        control_source=CONTROL_SOURCE_API)
-                elif mode == MODE_ALLOW_DISCHARGING:
-                    self.allow_discharging(CONTROL_SOURCE_API)
-        else:
-            self.__set_control_source(CONTROL_SOURCE_API)
-
-    @_tolerate_inverter_outage
-    def api_set_charge_rate(self, charge_rate: int):
-        """ Log and change config charge_rate and activate charging."""
-        if charge_rate < 0:
-            logger.warning(
-                'API: Invalid charge rate %d W', charge_rate)
-            return
-        logger.info('API: Setting charge rate to %d W', charge_rate)
-        self.api_overwrite = True
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_api_override_active(True)
-        if charge_rate != self.last_charge_rate:
-            self.force_charge(
-                charge_rate,
-                control_source=CONTROL_SOURCE_API)
-        else:
-            self.__set_control_source(CONTROL_SOURCE_API)
-
-    @_tolerate_inverter_outage
-    def api_set_limit_battery_charge_rate(self, limit: int):
-        """ Set dynamic battery charge rate limit from external call
-
-        Args:
-            limit: Maximum battery charge rate in W (0 = no charging, -1 = no limit)
-        """
-        if limit < -1:
-            logger.warning('API: Invalid limit_battery_charge_rate %d W', limit)
-            return
-
-        logger.info('API: Setting limit_battery_charge_rate to %d W', limit)
-        self._limit_battery_charge_rate = limit
-
-        # If currently in MODE_LIMIT_BATTERY_CHARGE_RATE, apply immediately.
-        # Otherwise, publish the updated requested limit for external clients.
-        if self.last_mode == MODE_LIMIT_BATTERY_CHARGE_RATE:
-            self.limit_battery_charge_rate(
-                limit,
-                control_source=CONTROL_SOURCE_API)
-        elif self.mqtt_api is not None:
-            self.mqtt_api.publish_limit_battery_charge_rate(limit)
-
-    def api_get_limit_battery_charge_rate(self) -> int:
-        """ Get current dynamic battery charge rate limit """
-        return self._limit_battery_charge_rate
-
-    def api_set_always_allow_discharge_limit(self, limit: float):
-        """ Set always allow discharge limit for battery control via external API request.
-            The change is temporary and will not be written to the config file.
-        """
-        if limit < 0 or limit > 1:
-            logger.warning(
-                'API: Invalid always allow discharge limit %.2f', limit)
-            return
-        logger.info(
-            'API: Setting always allow discharge limit to %.2f', limit)
-        self.set_always_allow_discharge_limit(limit)
-
-    def api_set_max_charging_from_grid_limit(self, limit: float):
-        """ Set max charging from grid limit for battery control via external API request.
-            The change is temporary and will not be written to the config file.
-        """
-        if limit < 0 or limit > 1:
-            logger.warning(
-                'API: Invalid max charging from grid limit %.2f', limit)
-            return
-        logger.info(
-            'API: Setting max charging from grid limit to %.2f', limit)
-        self.set_max_charging_from_grid_limit(limit)
-
-    @_tolerate_inverter_outage
-    def api_set_grid_charge_lock(self, locked: bool) -> None:
-        """ Block/unblock charging from the grid on request of an external
-            system (e.g. HEMS or grid operator signal, section 14a EnWG).
-
-            locked=True: remember the current max_charging_from_grid_limit and
-            force it to 0, so batcontrol will not charge the battery from the
-            grid. An active forced grid charge (mode -1) is cancelled
-            immediately.
-            locked=False (default): restore the previously remembered limit.
-        """
-        if locked == self._grid_charge_locked:
-            return
-        logger.info('API: External grid charge lock set to %s', locked)
-        self._grid_charge_locked = locked
-        if locked:
-            self._pre_lock_max_charging_from_grid_limit = (
-                self.max_charging_from_grid_limit)
-            if self.last_mode == MODE_FORCE_CHARGING:
-                with self.__override_scope(Reason.GRID_CHARGE_LOCK):
-                    self.allow_discharging(CONTROL_SOURCE_API)
-            self.set_max_charging_from_grid_limit(0.0)
-        else:
-            if self._pre_lock_max_charging_from_grid_limit is not None:
-                # Clamp to always_allow_discharge_limit: it may have been
-                # lowered while locked, which would otherwise make
-                # set_max_charging_from_grid_limit reject the restore and
-                # leave the limit stuck at 0.0.
-                restore_value = min(
-                    self._pre_lock_max_charging_from_grid_limit,
-                    self.get_always_allow_discharge_limit())
-                self.set_max_charging_from_grid_limit(restore_value)
-                self._pre_lock_max_charging_from_grid_limit = None
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_grid_charge_locked(locked)
-
-    def api_set_min_price_difference(self, min_price_difference: float):
-        """ Set min price difference for battery control via external API request.
-            The change is temporary and will not be written to the config file.
-        """
-        if min_price_difference < 0:
-            logger.warning(
-                'API: Invalid min price difference %.3f', min_price_difference)
-            return
-        logger.info(
-            'API: Setting min price difference to %.3f', min_price_difference)
-        self.min_price_difference = min_price_difference
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_min_price_difference(min_price_difference)
-
-    def api_set_min_price_difference_rel(
-            self, min_price_difference_rel: float):
-        """ Log and change config min_price_difference_rel from external call """
-        if min_price_difference_rel < 0:
-            logger.warning(
-                'API: Invalid min price rel difference %.3f',
-                min_price_difference_rel)
-            return
-        logger.info(
-            'API: Setting min price rel difference to %.3f',
-            min_price_difference_rel)
-        self.min_price_difference_rel = min_price_difference_rel
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_min_price_difference_rel(
-                min_price_difference_rel
-            )
-
-    def api_set_production_offset(self, production_offset: float):
-        """ Set production offset percentage from external API request.
-            The change is temporary and will not be written to the config file.
-        """
-        if production_offset < 0 or production_offset > 2.0:
-            logger.warning(
-                'API: Invalid production offset %.3f (must be between 0.0 and 2.0)',
-                production_offset)
-            return
-        logger.info(
-            'API: Setting production offset to %.3f (%.1f%%)',
-            production_offset, production_offset * 100)
-        self.production_offset_percent = production_offset
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_production_offset(production_offset)
-
-    def api_set_peak_shaving_enabled(self, enabled_str: str):
-        """ Set peak shaving enabled/disabled via external API request.
-            The change is temporary and will not be written to the config file.
-        """
-        enabled = enabled_str.strip().lower() in ('true', 'on', '1')
-        logger.info('API: Setting peak shaving enabled to %s', enabled)
-        self.peak_shaving_config.enabled = enabled
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_peak_shaving_enabled(enabled)
-
-    def api_set_peak_shaving_allow_full_after(self, hour: int):
-        """ Set peak shaving target hour via external API request.
-            The change is temporary and will not be written to the config file.
-        """
-        if hour < 0 or hour > 23:
-            logger.warning(
-                'API: Invalid peak shaving allow_full_battery_after %d '
-                '(must be 0-23)', hour)
-            return
-        logger.info(
-            'API: Setting peak shaving allow_full_battery_after to %d', hour)
-        self.peak_shaving_config.allow_full_battery_after = hour
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_peak_shaving_allow_full_after(hour)
-
-    def api_set_peak_shaving_price_limit(self, price_limit: float):
-        """ Set peak shaving price limit via external API request.
-            The change is temporary and will not be written to the config file.
-
-            Any numeric value is accepted. To disable the price-based
-            component, pass -1 (or any value <= -1): no slot price <= -1
-            ever exists, so the price filter never matches. Values above -1
-            (including small negatives like -0.1) may still match negative
-            tariff slots and are NOT a disable-switch.
-        """
-        if isinstance(price_limit, bool):
-            # bool would silently coerce to 1.0/0.0 via float(); reject it
-            # so PeakShavingConfig's bool rejection still applies on this path.
-            logger.warning(
-                'API: Invalid peak_shaving price_limit %r: must be numeric, '
-                'not bool', price_limit)
-            return
-        try:
-            new_config = dataclasses.replace(
-                self.peak_shaving_config, price_limit=float(price_limit))
-        except (TypeError, ValueError) as exc:
-            logger.warning(
-                'API: Invalid peak_shaving price_limit %r: %s',
-                price_limit, exc)
-            return
-        logger.info(
-            'API: Setting peak shaving price_limit to %s',
-            new_config.price_limit)
-        self.peak_shaving_config = new_config
-        if self.mqtt_api is not None:
-            self.mqtt_api.publish_peak_shaving_price_limit(
-                new_config.price_limit)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.error('Inverter shutdown failed: %s', exc)

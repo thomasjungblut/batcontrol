@@ -1,7 +1,7 @@
-""" Hosting the read-only web API
+""" Hosting the web API
 
 The server runs uvicorn in a daemon thread next to the control loop, the same
-pattern MqttApi uses. The control loop stays the owner of the process: if the
+pattern for any background service. The control loop stays the owner of the process: if the
 HTTP server fails to start, batcontrol logs the failure and keeps controlling
 the battery.
 """
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Time granted to the event loop to shut down before the process moves on.
 SHUTDOWN_TIMEOUT = 5.0
-# Open streams (an MCP client's GET stream never ends on its own) are cut
+# Open streams are cut
 # after this long, so shutdown fits into SHUTDOWN_TIMEOUT and the lifespan
 # shutdown still runs.
 GRACEFUL_SHUTDOWN_TIMEOUT = 2

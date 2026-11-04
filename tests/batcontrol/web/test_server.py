@@ -122,13 +122,12 @@ def test_an_occupied_port_is_reported_not_hidden(fake_bc, caplog):
 
 def test_the_startup_log_never_contains_the_token(fake_bc, caplog):
     config = ApiConfig(enabled=True, host='127.0.0.1', port=free_port(),
-                       auth_token='super-secret', mcp_auth_token='also-secret')
+                       auth_token='super-secret')
     server = WebServer(fake_bc, config)
     with caplog.at_level('INFO'):
         server.start()
     try:
         assert 'super-secret' not in caplog.text
-        assert 'also-secret' not in caplog.text
         assert 'Web API listening' in caplog.text
     finally:
         server.shutdown()

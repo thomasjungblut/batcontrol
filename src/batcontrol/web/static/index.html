@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#030a05">
+  <title>batcontrol</title>
+  <!-- Relative paths only: the page also works behind a reverse-proxy subpath.
+       Nothing is loaded from the network. -->
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="bar">
+    <span class="brand">BATCONTROL <span id="version" class="dim version"></span></span>
+    <span id="online"></span>
+    <span id="evaluated" class="dim hide-sm"></span>
+    <span id="countdown" class="dim right"></span>
+  </header>
+
+  <form id="token" class="token" hidden>
+    <label for="token-input">This batcontrol requires an API token (api.auth_token):</label>
+    <input id="token-input" type="password" autocomplete="off" placeholder="bearer token">
+    <button class="toggle" type="submit">&gt;UNLOCK&lt;</button>
+  </form>
+
+  <p id="error" class="err" hidden></p>
+  <p id="loading" class="loading">LOADING<span class="blink">_</span></p>
+
+  <main id="main" class="layout" hidden>
+    <div class="tiles">
+      <section class="panel">
+        <span class="panel-title">BATTERY</span>
+        <div id="soc" class="big value"></div>
+        <div class="socbar" role="img" id="socbar">
+          <div id="socfill" class="fill"></div>
+          <div id="reserve-mark" class="reserve" title="reserve line"></div>
+        </div>
+        <div id="usable" class="dim line"></div>
+        <div id="reserve" class="line"></div>
+      </section>
+
+      <section class="panel">
+        <span class="panel-title">SAVINGS</span>
+        <div id="saving" class="big value"></div>
+        <div id="saving-label" class="line"></div>
+        <div id="monthly" class="dim line"></div>
+      </section>
+
+      <section class="panel">
+        <span class="panel-title">NOW</span>
+        <div id="mode" class="big mode"></div>
+        <p id="headline" class="headline"></p>
+        <button id="manual" class="toggle boxed" type="button"></button>
+      </section>
+    </div>
+
+    <section class="panel">
+      <span id="plan-title" class="panel-title">PLAN</span>
+      <ul id="charges" class="charges"></ul>
+      <p id="empty" class="dim small" hidden></p>
+      <div id="notes"></div>
+    </section>
+
+    <section class="panel">
+      <span class="panel-title">PRICES 24 H</span>
+      <div id="strip" class="strip" role="img" aria-label="Prices for the next 24 hours"></div>
+      <div id="legend" class="dim small"></div>
+    </section>
+  </main>
+</body>
+</html>

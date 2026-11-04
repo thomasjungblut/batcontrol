@@ -200,23 +200,6 @@ class TestOutageError:
 # refresh_api_values is best-effort
 # ---------------------------------------------------------------------------
 
-class TestRefreshApiValues:
-    def test_refresh_never_raises(self):
-        inv = MockInverter()
-        w = ResilientInverterWrapper(inv)
-        w.set_mode_allow_discharge()
-        inv.should_fail = True
-        # Must not raise even though the inverter is unreachable
-        w.refresh_api_values()
-        assert inv.refresh_calls == 1
-
-    def test_refresh_does_not_start_outage_tracking(self):
-        inv = MockInverter()
-        w = ResilientInverterWrapper(inv)
-        w.set_mode_allow_discharge()
-        inv.should_fail = True
-        w.refresh_api_values()
-        assert w._outage_start is None
 
 
 # ---------------------------------------------------------------------------

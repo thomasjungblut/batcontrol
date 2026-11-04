@@ -31,7 +31,6 @@ from ..value_utils import mask_sensitive_headers
 from .baseclass import DEFAULT_MAX_SOC, DEFAULT_MIN_SOC, InverterBaseclass
 
 logger = logging.getLogger(__name__)
-logger.info('Loading module ')
 
 logger_auth = logging.getLogger("batcontrol.inverter.fronius.auth")
 
@@ -540,32 +539,6 @@ class FroniusWR(InverterBaseclass):
                               }]
         response = self.set_time_of_use(timeofuselist)
 
-        return response
-
-    def set_mode_limit_battery_charge(self, limit_charge_rate: int):
-        """ Limit PV charging rate while allowing battery discharge
-
-        Args:
-            limit_charge_rate: Maximum charge rate in W (0 = no charging)
-        """
-        if limit_charge_rate < 0:
-            raise ValueError(f"limit_charge_rate must be >= 0, got {limit_charge_rate}")
-
-        # Always set TimeOfUse rule for mode 8 (even if 0 = no charging)
-        timeofuselist = [{'Active': True,
-                          'Power': int(limit_charge_rate),
-                          'ScheduleType': 'CHARGE_MAX',
-                          "TimeTable": {"Start": "00:00", "End": "23:59"},
-                          "Weekdays":
-                          {"Mon": True,
-                           "Tue": True,
-                           "Wed": True,
-                           "Thu": True,
-                           "Fri": True,
-                           "Sat": True,
-                           "Sun": True}
-                          }]
-        response = self.set_time_of_use(timeofuselist)
         return response
 
     def set_mode_force_charge(self, chargerate=500):
@@ -1116,17 +1089,11 @@ class FroniusWR(InverterBaseclass):
         """
         self.__set_em(power=power)
         self.em_power = power
-        if self.mqtt_api:
-            self.mqtt_api.generic_publish(
-                self.get_mqtt_inverter_topic() + 'em_power', power)
 
     def set_em_mode(self, mode):
         """ Change Energy Manangement mode."""
         self.__set_em(mode=mode)
         self.em_mode = mode
-        if self.mqtt_api:
-            self.mqtt_api.generic_publish(
-                self.get_mqtt_inverter_topic() + 'em_mode', mode)
 
     def shutdown(self):
         """Change back batcontrol changes."""
@@ -1134,165 +1101,3 @@ class FroniusWR(InverterBaseclass):
         self.restore_battery_config()
         self.restore_time_of_use_config()
         self.logout()
-
-    def activate_mqtt(self, api_mqtt_api):
-        """
-        Activates MQTT for the inverter.
-
-        This function starts the API functions and publishes all internal values via MQTT.
-        The MQTT topic is: base_topic + '/inverters/0/'
-
-        Parameters that can be set via MQTT:
-        - max_grid_charge_rate (int): Maximum power in W that can be
-                                          used to load the battery from the grid.
-        - max_pv_charge_rate (int): Maximum power in W that can be
-                                          used to load the battery from the PV.
-
-        Args:
-            api_mqtt_api: The MQTT API instance to be used for registering callbacks.
-
-        """
-        self.mqtt_api = api_mqtt_api
-        # /set is appended to the topic
-        self.mqtt_api.register_set_callback(self.get_mqtt_inverter_topic(
-        ) + 'max_grid_charge_rate', self.api_set_max_grid_charge_rate, int)
-        self.mqtt_api.register_set_callback(self.get_mqtt_inverter_topic(
-        ) + 'max_pv_charge_rate', self.api_set_max_pv_charge_rate, int)
-        self.mqtt_api.register_set_callback(self.get_mqtt_inverter_topic(
-        ) + 'em_mode', self.api_set_em_mode, int)
-        self.mqtt_api.register_set_callback(self.get_mqtt_inverter_topic(
-        ) + 'em_power', self.api_set_em_power, int)
-
-        self.publish_inverter_discovery_messages()
-
-    def api_extra_values(self) -> dict:
-        """ Energy management settings, see __init__. """
-        return {'em_mode': self.em_mode, 'em_power': self.em_power}
-
-    def publish_api_values(self, values):
-        """ Publishes all values to mqtt."""
-        # Common metrics first
-        super().publish_api_values(values)
-        # Fronius-specific values
-        topic = self.get_mqtt_inverter_topic()
-        self.mqtt_api.generic_publish(
-            topic + 'max_grid_charge_rate', values.max_grid_charge_rate)
-        self.mqtt_api.generic_publish(
-            topic + 'max_pv_charge_rate', values.max_pv_charge_rate)
-        self.mqtt_api.generic_publish(topic + 'min_soc', values.min_soc)
-        self.mqtt_api.generic_publish(topic + 'max_soc', values.max_soc)
-        self.mqtt_api.generic_publish(topic + 'capacity', values.capacity)
-        self.mqtt_api.generic_publish(topic + 'em_mode', values.extra['em_mode'])
-        self.mqtt_api.generic_publish(topic + 'em_power', values.extra['em_power'])
-
-    def publish_inverter_discovery_messages(self):
-        """Publish Home Assistant MQTT Auto Discovery messages for Fronius-specific sensors"""
-        # First publish common inverter sensors
-        super().publish_inverter_discovery_messages()
-
-        # Then publish Fronius-specific configuration sensors
-        if self.mqtt_api:
-            topic = self.get_mqtt_inverter_topic()
-            base_topic = self.mqtt_api.base_topic
-
-            # Fronius-specific configuration
-            self.mqtt_api.publish_mqtt_discovery_message(
-                f"Inverter {self.inverter_num} Max Grid Charge Rate",
-                f"batcontrol_inverter_{self.inverter_num}_max_grid_charge_rate",
-                "number", "power", "W",
-                base_topic + "/" + topic + "max_grid_charge_rate",
-                base_topic + "/" + topic + "max_grid_charge_rate/set",
-                entity_category="config",
-                min_value=0, max_value=10000, initial_value=10000)
-
-            self.mqtt_api.publish_mqtt_discovery_message(
-                f"Inverter {self.inverter_num} Max PV Charge Rate",
-                f"batcontrol_inverter_{self.inverter_num}_max_pv_charge_rate",
-                "number", "power", "W",
-                base_topic + "/" + topic + "max_pv_charge_rate",
-                base_topic + "/" + topic + "max_pv_charge_rate/set",
-                entity_category="config",
-                min_value=0, max_value=10000, initial_value=10000)
-
-            self.mqtt_api.publish_mqtt_discovery_message(
-                f"Inverter {self.inverter_num} EM Mode",
-                f"batcontrol_inverter_{self.inverter_num}_em_mode",
-                "number", None, None,
-                base_topic + "/" + topic + "em_mode",
-                base_topic + "/" + topic + "em_mode/set",
-                entity_category="config",
-                min_value=0, max_value=2, initial_value=0)
-
-            self.mqtt_api.publish_mqtt_discovery_message(
-                f"Inverter {self.inverter_num} EM Power",
-                f"batcontrol_inverter_{self.inverter_num}_em_power",
-                "number", "power", "W",
-                base_topic + "/" + topic + "em_power",
-                base_topic + "/" + topic + "em_power/set",
-                entity_category="config",
-                min_value=-10000, max_value=10000, initial_value=0)
-
-    def api_set_max_grid_charge_rate(self, max_grid_charge_rate: int):
-        """ Set the maximum power in W that can be used to load the battery from the grid."""
-        if max_grid_charge_rate < 0:
-            logger.warning(
-                'API: Invalid max_grid_charge_rate %sW',
-                max_grid_charge_rate
-            )
-            return
-        logger.info(
-            'API: Setting max_grid_charge_rate: %.1fW',
-            max_grid_charge_rate
-        )
-        self.max_grid_charge_rate = max_grid_charge_rate
-
-    def api_set_max_pv_charge_rate(self, max_pv_charge_rate: int):
-        """ Set the maximum power in W that can be used to load the battery from the PV."""
-        if max_pv_charge_rate < 0:
-            logger.warning(
-                'API: Invalid max_pv_charge_rate %s',
-                max_pv_charge_rate
-            )
-            return
-        logger.info(
-            'API: Setting max_pv_charge_rate: %.1fW',
-            max_pv_charge_rate
-        )
-        self.max_pv_charge_rate = max_pv_charge_rate
-
-    def api_set_em_mode(self, em_mode: int):
-        """ Set the Energy Management Mode."""
-        if not isinstance(em_mode, int):
-            logger.warning(
-                'API: Invalid type em_mode %s',
-                em_mode
-            )
-            return
-        if em_mode < 0 or em_mode > 2:
-            logger.warning(
-                'API: Invalid em_mode %s',
-                em_mode
-            )
-            return
-        logger.info(
-            'API: Setting em_mode: %s',
-            em_mode
-        )
-        self.set_em_mode(em_mode)
-
-    def api_set_em_power(self, em_power: int):
-        """ Change EnergeManagement Offset
-            positive = get from grid
-            negative = feed to grid
-        """
-        if not isinstance(em_power, int):
-            logger.warning(
-                'API: Invalid type em_power %s',
-                em_power
-            )
-            return
-        logger.info(
-            'API: Setting em_power: %s',
-            em_power
-        )
-        self.set_em_power(em_power)

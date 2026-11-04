@@ -1,111 +1,75 @@
-<img src="frontend/public/icon.svg" alt="batcontrol logo" width="128" align="right">
+# batcontrol (simple rules)
 
-# batcontrol
+A stripped-down fork of [batcontrol](https://github.com/MaStr/batcontrol) for one setup:
+a **Fronius GEN24** with battery (Solar API), **Tibber** 15-minute prices, about 15 kWh
+consumption a day and a 10 kWh battery. No solar or consumption forecasts: fog makes
+them wrong too often.
 
-Batcontrol controls your PV battery inverter based on dynamic electricity prices, solar production forecasts, and consumption patterns. When grid electricity is cheap and solar output is insufficient, it charges the battery from the grid. When prices are high, it holds the stored energy and avoids unnecessary discharge.
+## The rules
 
-[![batcontrol setup](https://mastr.github.io/batcontrol/assets/img_0684.jpeg)](https://mastr.github.io/batcontrol/assets/img_0684.jpeg)
+The house always takes solar first, then the battery, then the grid. batcontrol only
+decides when to **charge from the grid**. There are three reasons to do so:
 
-[![Pylint](https://github.com/MaStr/batcontrol/actions/workflows/pylint.yml/badge.svg?branch=main)](https://github.com/MaStr/batcontrol/actions/workflows/pylint.yml)
-[![Docker Image CI](https://github.com/MaStr/batcontrol/actions/workflows/docker-image.yml/badge.svg?branch=main)](https://github.com/MaStr/batcontrol/actions/workflows/docker-image.yml)
+1. **Negative price.** Any 15-minute slot below 0 ct charges at full speed
+   (`max_grid_charge_rate`), day or night. It lowers the average price and helps the grid.
+2. **Night reserve.** The battery has to get the house through 16:00 to 08:00. The reserve
+   line is **4 kWh at midnight**, plus 300 W for every hour before midnight
+   (6.4 kWh at 16:00) and minus 300 W for every hour after it (1.6 kWh at 08:00, which
+   covers the slow solar start). If the usable energy (above the minimum SoC) is below the
+   line, the shortfall is bought in the **cheapest slots before 08:00**. A slot only
+   qualifies if it is at least `min_price_difference` (5 ct) cheaper than the most
+   expensive hour still to come before 08:00. If no slot is cheap enough, nothing is
+   bought, because running out would cost the same.
+3. **Manual.** The dashboard button charges at full speed for one hour.
 
-[Documentation](https://mastr.github.io/batcontrol/) — [Development Documentation](https://mastr.github.io/batcontrol-dev/) — [Home Assistant Add-on](https://github.com/MaStr/batcontrol_ha_addon)
+Everything is re-evaluated every 3 minutes. Shortfalls smaller than
+`min_recharge_amount` (500 Wh) are ignored, but a charge that has already started runs on
+until the gap is closed.
 
-## Dashboard
+**Savings** are estimated per charge block as energy × (price of the expensive hour it
+replaces − charge price). For negative prices the comparison is the 24-hour median. The
+dashboard adds them up for the next 24 hours and multiplies by 30 for a rough monthly figure.
 
-With the optional read-only API enabled, batcontrol serves a dashboard showing what it is doing
-and why — the current decision with its full trace, the state of charge, and the price forecast.
-It is served by batcontrol itself, needs no additional service, and appears as a sidebar panel in
-the Home Assistant add-on.
-
-[![batcontrol dashboard](https://mastr.github.io/batcontrol/assets/dashboard.png)](https://mastr.github.io/batcontrol/features/dashboard/)
-
-The same port serves a [REST API](https://mastr.github.io/batcontrol/integrations/rest-api/)
-with its own OpenAPI documentation and, optionally, an
-[MCP server](https://mastr.github.io/batcontrol/integrations/mcp-server/) so an AI assistant can
-answer questions about the battery. All of it is read-only: control stays with the MQTT API.
-
-## Supported Systems
-
-**Inverters / batteries**
-
-- Fronius Gen24 (HTTP API and Modbus TCP)
-- Any inverter or battery system via MQTT bridge
-
-**Dynamic tariff providers**
-
-- Tibber, aWATTar, evcc, EnergyForecast.de, static zone tariffs (e.g. Octopus)
-
-**Solar forecast sources**
-
-- Forecast.Solar, Solar-Prognose.de, evcc, Home Assistant Solar Forecast ML
-
-## Requirements
-
-1. A PV installation with a supported inverter — Fronius Gen24 with a BYD battery, or any system reachable via an MQTT bridge.
-2. Inverter login credentials (customer or technician access).
-3. A dynamic electricity tariff (Tibber, aWATTar, or another supported provider) for price-based charging. A static tariff is sufficient if you only want peak shaving.
-
-## Installation
-
-Batcontrol runs as a Docker container, a Home Assistant add-on, or directly from a local Python environment. See the [Installation Guide](https://mastr.github.io/batcontrol/getting-started/installation/) for step-by-step instructions.
-
-Quick start with Docker:
-
-```sh
-mkdir -p ./config ./logs
-
-docker run -d \
-  --name batcontrol \
-  -v "$PWD/config:/app/config" \
-  -v "$PWD/logs:/app/logs" \
-  mastr950/batcontrol:latest
-```
-
-To also reach the dashboard, publish its port and set `api.enabled: true` with
-`api.host: 0.0.0.0` in the configuration:
-
-```sh
-docker run -d \
-  --name batcontrol \
-  -p 8080:8080 \
-  -v "$PWD/config:/app/config" \
-  -v "$PWD/logs:/app/logs" \
-  mastr950/batcontrol:latest
-```
-
-On the first start, if no configuration file is found, batcontrol copies a sample config with a dummy inverter into `./config/batcontrol_config.yaml`. The dummy inverter simulates responses without touching real hardware, so you can explore the setup safely. Edit the file to configure your actual inverter and tariff provider before pointing batcontrol at real hardware.
+During the day (08:00 to 16:00) the plan for the coming night is shown as a **preview**,
+computed with the current battery level. It is not acted on until 16:00.
 
 ## Configuration
 
-The [sample configuration file](config/batcontrol_config_dummy.yaml) documents all available options. The documentation covers each section in detail:
+See [`config/batcontrol_config_dummy.yaml`](config/batcontrol_config_dummy.yaml). An
+existing batcontrol config keeps working, and keys the rules don't use are ignored (and
+logged once at startup).
 
-- [Main Configuration](https://mastr.github.io/batcontrol/configuration/batcontrol-configuration/)
-- [Inverter](https://mastr.github.io/batcontrol/configuration/inverter-configuration/)
-- [Dynamic Tariff Provider](https://mastr.github.io/batcontrol/configuration/dynamic-tariff-provider/)
-- [Solar Forecast](https://mastr.github.io/batcontrol/configuration/solar-forecast/)
-- [Consumption Forecast](https://mastr.github.io/batcontrol/configuration/consumption-forecast/)
+## Run
 
-## How It Works
+```bash
+docker build -t batcontrol .
+docker run -v ./config:/app/config -v ./logs:/app/logs -p 8080:8080 batcontrol
+# or from source
+uv venv --python 3.14 && uv pip install -e '.[test]'
+python -m batcontrol --config config/batcontrol_config.yaml [--one-shot]
+```
 
-Batcontrol independently fetches and refreshes electricity price forecasts, expected solar production, and consumption predictions. These are managed in the background on their own schedules depending on the data source.
+The dashboard is at `http://<host>:<api.port>/`. It is plain HTML/CSS/JS in
+`src/batcontrol/web/static/`, with no build step.
 
-A 3-minute control loop evaluates the current battery state against those forecasts and sets the inverter to one of four modes: discharge allowed, avoid discharge, force charge from grid, or rate-limited PV charging (peak shaving).
+## API
 
-Peak shaving works with or without a dynamic tariff: even on a flat rate, batcontrol uses the PV and consumption forecasts to spread battery charging across the day, so the battery is available to absorb the most solar energy possible rather than filling up early.
+All under `/api/v1/`. Timestamps are epoch ms, prices EUR/kWh, energy Wh, power W.
 
-A detailed description of the decision logic is in [How Batcontrol Works](https://mastr.github.io/batcontrol/getting-started/how-batcontrol-works/).
+| Method | Path | |
+|---|---|---|
+| GET | `/health` | always open, for health checks |
+| GET | `/status` | battery, mode and reason, the plan with savings, 24 h of prices |
+| GET | `/manual-charge` | whether a manual charge is running |
+| POST | `/manual-charge` | `{"minutes": 60}` (1–240), charge at full speed |
+| DELETE | `/manual-charge` | stop it |
 
-## FAQ
+Set `api.auth_token` to require `Authorization: Bearer <token>` on everything except
+`/health`. Without a token, anyone on your network can start a manual charge.
 
-**What inverter settings does batcontrol change?**
+## Tests
 
-On first run it enables the Solar.API (local network only) and saves your current battery and usage schedule configuration. It restores those saved settings on a clean shutdown. During operation it adjusts the battery control mode on every cycle.
-
-**Can I run other software that controls the inverter at the same time?**
-
-No. Concurrent inverter control software will cause conflicts. If you have previously used Modbus-based tools, disable Modbus and restart the inverter before starting batcontrol.
-
-**What if I need to change inverter settings while batcontrol is running?**
-
-Shut down batcontrol first, make your changes, then restart it. Changes made through the inverter's local web interface while batcontrol is running may be overwritten on the next cycle.
+```bash
+./run_tests.sh
+uv run pylint src/batcontrol
+```

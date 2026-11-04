@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from batcontrol.web.app import create_app
 from batcontrol.web.config import ApiConfig
 
-from .conftest import API_PATHS, MCP_HEADERS, MCP_INIT
+from .conftest import API_PATHS
 
 TOKEN = 'a-very-secret-token'
 
@@ -48,6 +48,13 @@ def test_wrong_credentials_are_401(secured, header):
     response = secured.get('/api/v1/status',
                            headers={'Authorization': header})
     assert response.status_code == 401
+
+
+def test_manual_charge_needs_the_token(secured, fake_bc):
+    """The one write must be protected like everything else."""
+    assert secured.post('/api/v1/manual-charge').status_code == 401
+    assert secured.delete('/api/v1/manual-charge').status_code == 401
+    assert fake_bc.manual_requests == []
 
 
 def test_correct_token_is_accepted(secured):
@@ -104,29 +111,21 @@ NON_ASCII = (
 )
 
 
-@pytest.fixture(name='guarded', params=['rest', 'mcp'])
-def fixture_guarded(request, fake_bc):
-    """Opens an app whose REST API or MCP endpoint requires `token`.
+@pytest.fixture(name='guarded')
+def fixture_guarded(fake_bc):
+    """Opens an app whose API requires `token`.
 
-    /mcp has its own ASGI bearer guard, so every token check has to hold in
-    two places. Returns a function that sends one authenticated request.
+    Returns a function that sends one authenticated request.
     """
     with contextlib.ExitStack() as stack:
         def open_with(token):
-            if request.param == 'rest':
-                config = ApiConfig(enabled=True, auth_token=token)
-            else:
-                config = ApiConfig(enabled=True, mcp_enabled=True,
-                                   mcp_auth_token=token)
+            config = ApiConfig(enabled=True, auth_token=token)
             client = stack.enter_context(TestClient(
                 create_app(fake_bc, config), base_url='http://127.0.0.1'))
 
             def send(header=None):
                 headers = {} if header is None else {'Authorization': header}
-                if request.param == 'rest':
-                    return client.get('/api/v1/status', headers=headers)
-                return client.post('/mcp', json=MCP_INIT,
-                                   headers={**MCP_HEADERS, **headers})
+                return client.get('/api/v1/status', headers=headers)
             return send
         yield open_with
 

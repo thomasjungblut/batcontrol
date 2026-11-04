@@ -1,4 +1,4 @@
-""" Configuration of the read-only web API
+""" Configuration of the web API
 
 Parses the `api:` block of the batcontrol configuration. Home Assistant form
 fields may deliver strings for booleans and integers, so every value goes
@@ -17,7 +17,6 @@ DEFAULT_PORT = 8080
 
 # Path prefixes served by the application
 API_PREFIX = '/api/v1'
-MCP_PATH = '/mcp'
 
 # Bind addresses that mean "this machine only": no warning about an
 # unauthenticated bind for these.
@@ -44,69 +43,33 @@ def token_matches(presented, expected: str) -> bool:
 
 
 @dataclasses.dataclass(frozen=True)
-class ApiConfig:  # pylint: disable=too-many-instance-attributes
+class ApiConfig:
     """ Validated `api:` configuration block.
 
-    Two independent tokens, so the MCP token can be handed to an assistant
-    without giving away access to the REST API:
-
-      auth_token      - protects /api/v1/** (except /health)
-      mcp_auth_token  - protects /mcp; falls back to auth_token when empty,
-                        so securing the API never leaves MCP wide open
-
-    An empty token means no authentication at all for that surface - there is
+    An empty auth_token means no authentication at all - there is
     deliberately no half protected state.
     """
     enabled: bool = False
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     dashboard_enabled: bool = True
-    # Swagger UI (/docs) and the OpenAPI schema (/openapi.json). Off by
-    # default: a running installation does not need its API described to
-    # every visitor, and the schema is published with the documentation.
+    # Swagger UI (/docs) and the OpenAPI schema (/openapi.json).
     docs_enabled: bool = False
-    mcp_enabled: bool = False
     auth_token: str = ''
-    mcp_auth_token: str = ''
 
     @property
     def auth_enabled(self) -> bool:
-        """ True when the REST API requires a bearer token. """
+        """ True when the API requires a bearer token. """
         return bool(self.auth_token)
-
-    @property
-    def effective_mcp_token(self) -> str:
-        """ The token /mcp requires, inheriting auth_token when unset. """
-        return self.mcp_auth_token or self.auth_token
-
-    @property
-    def mcp_auth_enabled(self) -> bool:
-        """ True when /mcp requires a bearer token. """
-        return bool(self.effective_mcp_token)
-
-    @property
-    def mcp_token_is_separate(self) -> bool:
-        """ True when MCP uses its own token rather than the API's. """
-        return bool(self.mcp_auth_token) and \
-            self.mcp_auth_token != self.auth_token
 
     def describe(self) -> str:
         """ One line summary for the startup log. Never includes a token. """
-        if not self.mcp_enabled:
-            mcp = 'off'
-        elif not self.mcp_auth_enabled:
-            mcp = 'on (auth: off)'
-        elif self.mcp_token_is_separate:
-            mcp = 'on (auth: own token)'
-        else:
-            mcp = 'on (auth: shared with api)'
         return (
             f'http://{f"[{self.host}]" if ":" in self.host else self.host}'
             f':{self.port}'
             f' (dashboard: {"on" if self.dashboard_enabled else "off"},'
             f' docs: {"on" if self.docs_enabled else "off"},'
-            f' api auth: {"on" if self.auth_enabled else "off"},'
-            f' mcp: {mcp})'
+            f' auth: {"on" if self.auth_enabled else "off"})'
         )
 
 
@@ -171,23 +134,16 @@ def from_config(configdict: dict) -> ApiConfig:
             section.get('dashboard_enabled'), 'dashboard_enabled', True),
         docs_enabled=_as_bool(
             section.get('docs_enabled'), 'docs_enabled', False),
-        mcp_enabled=_as_bool(section.get('mcp_enabled'), 'mcp_enabled', False),
         auth_token=str(section.get('auth_token') or '').strip(),
-        mcp_auth_token=str(section.get('mcp_auth_token') or '').strip(),
     )
 
-    if config.enabled and config.host not in LOOPBACK_HOSTS:
-        if not config.auth_enabled:
-            logger.warning(
-                'API is bound to %s without an auth_token. Anyone on that'
-                ' network can read your battery, price and consumption data.'
-                ' Set api.auth_token or put a reverse proxy in front of it.',
-                config.host
-            )
-        if config.mcp_enabled and not config.mcp_auth_enabled:
-            logger.warning(
-                'MCP is bound to %s without a token. Set api.mcp_auth_token'
-                ' (or api.auth_token, which it inherits).', config.host
-            )
+    if config.enabled and config.host not in LOOPBACK_HOSTS \
+            and not config.auth_enabled:
+        logger.warning(
+            'API is bound to %s without an auth_token. Anyone on that'
+            ' network can read your battery and price data and start a'
+            ' manual charge. Set api.auth_token or put a reverse proxy in'
+            ' front of it.', config.host
+        )
 
     return config

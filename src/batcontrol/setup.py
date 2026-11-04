@@ -56,7 +56,7 @@ def load_config(configfile:str) -> dict:
         dict: The loaded configuration
 
     Raises:
-        RuntimeError: If the config file is not found or no PV installations are found
+        RuntimeError: If the config file is not found or not a mapping
 
     """
     if not os.path.isfile(configfile):
@@ -66,10 +66,6 @@ def load_config(configfile:str) -> dict:
         config_str = f.read()
 
     config = yaml.safe_load(config_str)
-
-    if config['pvinstallations']:
-        pass
-    else:
-        raise RuntimeError('No PV Installation found')
-
+    if not isinstance(config, dict):
+        raise RuntimeError(f'Configfile {configfile} is empty or not a mapping')
     return config

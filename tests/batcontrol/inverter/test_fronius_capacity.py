@@ -104,7 +104,7 @@ class TestFroniusCapacityOverride(unittest.TestCase):
     def test_max_capacity_uses_configured_capacity(
         self, mock_send_request, mock_set_allow, mock_set_solar, mock_backup_tou,
         mock_get_powerunit, mock_get_battery, mock_get_firmware):
-        """get_max_capacity() reflects the configured capacity override."""
+        """get_capacity() reflects the configured capacity override."""
         self._setup_mocks(mock_get_firmware, mock_get_battery, mock_get_powerunit,
                           mock_send_request, designed_capacity=10000)
 
@@ -112,8 +112,8 @@ class TestFroniusCapacityOverride(unittest.TestCase):
         config['capacity'] = 8000
         inverter = FroniusWR(config)
 
-        # BAT_M0_SOC_MAX is 100 in the mocked battery config.
-        self.assertEqual(inverter.get_max_capacity(), 8000)
+        self.assertEqual(inverter.get_capacity(), 8000)
+        self.assertEqual(inverter.max_soc, 100)
 
     @patch('batcontrol.inverter.fronius.FroniusWR.get_firmware_version')
     @patch('batcontrol.inverter.fronius.FroniusWR.get_battery_config')

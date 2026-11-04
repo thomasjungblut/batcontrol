@@ -16,7 +16,7 @@ Behaviour:
   Successful mode commands supersede earlier failed mode commands.
 - If failures persist past the tolerance window, they are escalated to
   InverterOutageError, which terminates batcontrol.
-- shutdown() and refresh_api_values() are best-effort: they never abort a cycle.
+- shutdown() is best-effort: they never abort a cycle.
 """
 
 import time
@@ -34,11 +34,11 @@ DEFAULT_OUTAGE_TOLERANCE_SECONDS = 24 * 60
 # failures are tolerated instead of treated as fail-fast configuration errors.
 _COMMAND_METHODS = frozenset({
     'set_mode_force_charge', 'set_mode_avoid_discharge',
-    'set_mode_allow_discharge', 'set_mode_limit_battery_charge',
+    'set_mode_allow_discharge',
 })
 
 # Best-effort methods never abort a control cycle - just log and move on.
-_BEST_EFFORT_METHODS = frozenset({'refresh_api_values', 'shutdown'})
+_BEST_EFFORT_METHODS = frozenset({'shutdown'})
 
 
 def _remaining_failures(failed_methods, successful_method):

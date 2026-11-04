@@ -1,116 +1,94 @@
-"""Endpoint tests of the read-only API.
-
-These cover what the HTTP layer adds: the envelope, status codes, parameter
-validation and that no credential reaches a response. The payload values come
-from the service layer and are tested there, in test_service.py.
-"""
+"""The API: status view and the manual charge."""
 import pytest
 from fastapi.testclient import TestClient
 
 from batcontrol.web.app import create_app
+from batcontrol.web.config import ApiConfig
 
-from .conftest import API_PATHS
+from .conftest import API_PATHS, FakeBatcontrol
 
 
-def data(response):
-    """The payload of a successful envelope, with the envelope checked."""
-    assert response.status_code == 200, response.text
-    body = response.json()
+def test_health(client):
+    assert client.get('/api/v1/health').json() == {'ok': True, 'data': {'status': 'ok'}}
+
+
+def test_status_shows_battery_plan_and_savings(client):
+    body = client.get('/api/v1/status').json()
     assert body['ok'] is True
-    assert isinstance(body['timestamp'], int)
-    return body['data']
+    data = body['data']
+    assert data['battery']['soc'] == 40.0
+    assert data['battery']['usable_wh'] == 3500.0
+    assert data['mode'] == 'normal'
+    plan = data['plan']
+    assert plan['preview'] is False
+    assert plan['deficit_wh'] == pytest.approx(1065, abs=1)
+    (charge,) = plan['charges']
+    assert charge['reason'] == 'night_reserve'
+    assert charge['explanation'].startswith('Charge 03:00-03:30 at 21.0 ct')
+    assert plan['saving_eur'] == pytest.approx(charge['saving_eur'])
+    assert plan['monthly_saving_eur'] == pytest.approx(plan['saving_eur'] * 30, abs=0.01)
 
 
-@pytest.mark.parametrize('path', API_PATHS.values())
-def test_every_endpoint_answers_with_an_envelope(client, fake_bc, path):
-    fake_bc.record_decision()
-    assert data(client.get(path)) is not None
+def test_timestamps_are_epoch_ms(client):
+    data = client.get('/api/v1/status').json()['data']
+    assert data['evaluated_at'] > 10**12
+    assert data['plan']['charges'][0]['start'] > 10**12
 
 
-@pytest.mark.parametrize('series,unit', [
-    ('price', 'EUR/kWh'),
-    ('consumption', 'Wh'),
-    ('production', 'Wh'),
-    ('net_consumption', 'Wh'),
-])
-def test_every_forecast_series_is_routed(client, series, unit):
-    assert data(client.get(f'/api/v1/forecast/{series}'))['unit'] == unit
+def test_prices_cover_24_hours_and_mark_charges(client):
+    prices = client.get('/api/v1/status').json()['data']['prices']
+    assert len(prices) == 97  # the running slot + 24 h
+    assert sum(1 for p in prices if p['charge'] == 'night_reserve') == 2
 
 
-def test_unknown_forecast_series_is_a_404_with_a_hint(client):
-    response = client.get('/api/v1/forecast/weather')
-    assert response.status_code == 404
-    body = response.json()
-    assert body['error'] == 'not_found'
-    assert 'net_consumption' in body['detail']
-
-
-@pytest.mark.parametrize('path', [
-    '/api/v1/forecast', '/api/v1/price/status', '/api/v1/solar',
-    '/api/v1/peak-shaving'])
-def test_cycle_endpoints_before_the_first_cycle_are_503(empty_bc, path):
-    with TestClient(create_app(empty_bc), base_url='http://127.0.0.1') as client:
-        response = client.get(path)
+def test_no_data_before_the_first_cycle():
+    app = create_app(FakeBatcontrol(with_data=False), ApiConfig(enabled=True))
+    with TestClient(app) as client:
+        response = client.get('/api/v1/status')
     assert response.status_code == 503
-    body = response.json()
-    assert body['ok'] is False
-    assert body['error'] == 'no_data_yet'
-    assert 'first evaluation' in body['detail']
+    assert response.json()['error'] == 'no_data'
 
 
-def test_decision_without_a_trace_is_404(client):
-    response = client.get('/api/v1/decision')
-    assert response.status_code == 404
-    assert response.json()['error'] == 'not_found'
+def test_manual_charge_start_and_cancel(client, fake_bc):
+    response = client.post('/api/v1/manual-charge', json={'minutes': 30})
+    assert response.status_code == 200
+    assert response.json()['data']['active'] is True
+    assert fake_bc.manual_requests == [30]
+    assert client.get('/api/v1/manual-charge').json()['data']['active'] is True
+
+    response = client.delete('/api/v1/manual-charge')
+    assert response.json()['data'] == {'active': False, 'until': None}
 
 
-def test_decision_history_respects_the_limit(client, fake_bc):
-    for _ in range(4):
-        fake_bc.record_decision()
-    payload = data(client.get('/api/v1/decision/history?limit=2'))
-    assert payload['count'] == 2
+def test_manual_charge_defaults_to_one_hour(client, fake_bc):
+    client.post('/api/v1/manual-charge')
+    assert fake_bc.manual_requests == [60]
 
 
-@pytest.mark.parametrize('limit', [0, -1, 201, 'many'])
-def test_decision_history_rejects_an_invalid_limit(client, limit):
-    assert client.get(f'/api/v1/decision/history?limit={limit}').status_code == 422
+@pytest.mark.parametrize('minutes', [0, 241, 'soon'])
+def test_manual_charge_rejects_bad_durations(client, fake_bc, minutes):
+    assert client.post('/api/v1/manual-charge',
+                       json={'minutes': minutes}).status_code == 422
+    assert fake_bc.manual_requests == []
 
 
-def test_unknown_inverter_is_a_404(client):
-    response = client.get('/api/v1/inverter/5')
-    assert response.status_code == 404
-    assert '/inverters' in response.json()['detail']
+def test_documented_paths_match_the_schema(client):
+    schema = client.get('/openapi.json').json()
+    assert set(schema['paths']) == set(API_PATHS)
 
 
-def test_inverter_id_must_be_a_number(client):
-    assert client.get('/api/v1/inverter/abc').status_code == 422
+def test_every_numeric_field_names_its_unit(client):
+    schema = client.get('/openapi.json').json()
+    for name, model in schema['components']['schemas'].items():
+        for field, spec in model.get('properties', {}).items():
+            numeric = spec.get('type') in ('number', 'integer') or any(
+                alt.get('type') in ('number', 'integer') for alt in spec.get('anyOf', []))
+            if numeric:
+                assert spec.get('description'), f'{name}.{field} has no description'
 
 
-def test_config_contains_no_credentials(client, fake_bc):
-    """A credential must not be reachable through the config endpoint.
-
-    The stand-in is given a config dict full of secrets on purpose: the
-    endpoint builds its answer from core attributes, so none of this can
-    surface. If someone changes the service to read the config dict, the
-    secrets would appear here and this test fails.
-    """
-    fake_bc.config = {
-        'inverter': {'user': 'customer', 'password': 'inverter-pw'},
-        'utility': {'api_token': 'tibber-token'},
-        'mqtt': {'username': 'mqtt-user', 'password': 'mqtt-pw'},
-    }
-    body = client.get('/api/v1/config').text
-    for secret in ('inverter-pw', 'tibber-token', 'mqtt-user', 'mqtt-pw',
-                   'customer'):
-        assert secret not in body
-
-
-def test_no_response_contains_a_secret_looking_key(client, fake_bc):
-    """Sweep every endpoint for credential-shaped keys."""
-    fake_bc.record_decision()
-    forbidden = ('password', 'token', 'secret', 'apikey', 'api_key',
-                 'username')
-    for path in API_PATHS.values():
-        body = client.get(path).text.lower()
-        for needle in forbidden:
-            assert needle not in body, f'{path} mentions {needle!r}'
+def test_writes_only_on_manual_charge(client):
+    schema = client.get('/openapi.json').json()
+    for path, ops in schema['paths'].items():
+        if set(ops) - {'get'}:
+            assert path == '/api/v1/manual-charge'

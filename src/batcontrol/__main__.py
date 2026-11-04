@@ -3,31 +3,21 @@
 import argparse
 import datetime
 import logging
-from pathlib import Path
-import shutil
 import signal
 import sys
-import threading
-import time
 
 from .banner import log_startup_banner
 from .core import Batcontrol
 from .inverter import InverterOutageError
 from .setup import setup_logging, load_config
+from .web import config as web_config
+from .web.server import WebServer
 
 
 CONFIGFILE = "config/batcontrol_config.yaml"
 EVALUATIONS_EVERY_MINUTES = 3  # Every x minutes on the clock
 LOGFILE_ENABLED_DEFAULT = True
 LOGFILE = "logs/batcontrol.log"
-
-
-def clear_persisted_cache(data_directory):
-    """Remove only provider cache files before any provider loads them."""
-    try:
-        shutil.rmtree(Path(data_directory) / 'cache')
-    except FileNotFoundError:
-        pass
 
 
 def parse_arguments():
@@ -45,14 +35,6 @@ def parse_arguments():
         '--config', '-c',
         default=CONFIGFILE,
         help=f'Path to configuration file (default: {CONFIGFILE})'
-    )
-    parser.add_argument(
-        '--data-dir', type=Path, default=Path('data'),
-        help='Shared application data directory (default: ./data)',
-    )
-    parser.add_argument(
-        '--clear-cache', action='store_true',
-        help='Delete persisted provider caches before starting normally',
     )
     return parser.parse_args()
 
@@ -106,35 +88,15 @@ def main() -> int:
         logging.getLogger("asyncio").setLevel(logging.WARNING)
         logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
         logging.getLogger("batcontrol.inverter.fronius.auth").setLevel(logging.INFO)
-        logging.getLogger(
-            "batcontrol.forecastconsumption.forecast_homeassistant.details"
-        ).setLevel(logging.INFO)
-        logging.getLogger(
-            "batcontrol.forecastconsumption.forecast_homeassistant.communication"
-        ).setLevel(logging.INFO)
 
-    if args.clear_cache:
-        try:
-            clear_persisted_cache(args.data_dir)
-        except OSError:
-            logger.error('Could not clear provider cache; startup aborted')
-            return 1
-        logger.info('Cleared persisted provider caches')
+    bc = Batcontrol(config)
 
-    bc = Batcontrol(config, data_directory=args.data_dir)
-
-    # SIGHUP (kill -HUP <pid>) requests a refresh of all providers. The
-    # handler only logs and sets a flag; the refresh happens at the start of
-    # the next control loop interval, the running loop is not interrupted.
-    reload_requested = threading.Event()
-
-    def _on_sighup(_signum, _frame):
-        logger.info("SIGHUP received: all providers will be refreshed "
-                    "in the next interval")
-        reload_requested.set()
-
-    if hasattr(signal, 'SIGHUP'):
-        signal.signal(signal.SIGHUP, _on_sighup)
+    api_config = web_config.from_config(config)
+    web_server = None
+    if api_config.enabled and not args.one_shot:
+        web_server = WebServer(bc, api_config)
+        if not web_server.start():
+            web_server = None
 
     def _on_sigterm(_signum, _frame):
         raise KeyboardInterrupt
@@ -143,11 +105,7 @@ def main() -> int:
 
     try:
         while True:
-            if reload_requested.is_set():
-                reload_requested.clear()
-                logger.info("Refreshing all providers (requested by SIGHUP)")
-                bc.refresh_all_providers()
-            logger.info("Starting batcontrol")
+            bc.wakeup.clear()
             bc.run()
 
             # Exit after first run if --one-shot is specified
@@ -165,10 +123,13 @@ def main() -> int:
             # add time increments to trigger next evaluation
             next_eval += datetime.timedelta(minutes=EVALUATIONS_EVERY_MINUTES)
             sleeptime = (next_eval - loop_now).total_seconds()
-            logger.info(
+            bc.next_evaluation = next_eval.timestamp()
+            logger.debug(
                 "Next evaluation at %s. Sleeping for %d seconds",
                 next_eval.strftime('%H:%M:%S'), int(sleeptime))
-            time.sleep(sleeptime)
+            # A manual charge from the dashboard wakes the loop up early.
+            if bc.wakeup.wait(sleeptime):
+                logger.info("Woken up early by a manual charge request")
     except KeyboardInterrupt:
         print("Shutting down")
     except InverterOutageError as e:
@@ -179,6 +140,8 @@ def main() -> int:
         print(f"FATAL: Inverter outage exceeded tolerance - {e}")
         return 1
     finally:
+        if web_server is not None:
+            web_server.shutdown()
         bc.shutdown()
         del bc
     return 0

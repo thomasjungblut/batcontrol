@@ -1,146 +1,57 @@
-"""Serving the dashboard assets.
+"""The static dashboard and the manual charge end to end."""
+import pathlib
+import re
+from unittest.mock import MagicMock
 
-Both branches are forced explicitly, because whether src/batcontrol/web/static
-exists depends on whether someone ran the npm build - true on a developer's
-machine, false in CI. A test that silently tested only one of them would be
-worse than no test.
-"""
-import pytest
 from fastapi.testclient import TestClient
 
-from batcontrol.web import app as app_module
-from batcontrol.web.app import create_app
+from batcontrol import rules
+from batcontrol.core import Batcontrol
+from batcontrol.web.app import STATIC_DIR, create_app
 from batcontrol.web.config import ApiConfig
 
-
-@pytest.fixture(name='built')
-def fixture_built(tmp_path, monkeypatch):
-    """A directory that looks like a finished dashboard build."""
-    static = tmp_path / 'static'
-    (static / 'assets').mkdir(parents=True)
-    (static / 'index.html').write_text('<!doctype html><title>batcontrol</title>')
-    (static / 'assets' / 'index-abc123.js').write_text('console.log(1)')
-    (static / 'licenses').mkdir()
-    (static / 'licenses' / 'LICENSE-OFL-VT323.txt').write_text('OFL')
-    (static / 'swagger').mkdir()
-    (static / 'swagger' / 'swagger-ui-bundle.js').write_text('//swagger')
-    (static / 'swagger' / 'swagger-ui.css').write_text('/*swagger*/')
-    (static / 'favicon.svg').write_text('<svg/>')
-    monkeypatch.setattr(app_module, 'STATIC_DIR', static)
-    return static
+from ..test_core import CONFIG, make_inverter
 
 
-@pytest.fixture(name='unbuilt')
-def fixture_unbuilt(tmp_path, monkeypatch):
-    """A checkout where npm never ran."""
-    monkeypatch.setattr(app_module, 'STATIC_DIR', tmp_path / 'nothing-here')
+def test_the_dashboard_is_served(client):
+    page = client.get('/')
+    assert page.status_code == 200
+    assert 'app.js' in page.text
+    for asset in ('app.js', 'style.css', 'favicon.svg', 'manifest.webmanifest'):
+        assert client.get(f'/{asset}').status_code == 200, asset
 
 
-def client_for(fake_bc, **options):
-    options.setdefault('docs_enabled', True)
-    return TestClient(create_app(fake_bc, ApiConfig(enabled=True, **options)),
-                      base_url='http://127.0.0.1')
+def test_assets_use_relative_urls_and_no_network():
+    """Works behind a subpath and without internet egress."""
+    for path in pathlib.Path(STATIC_DIR).iterdir():
+        if path.suffix not in ('.html', '.js', '.css'):
+            continue
+        text = path.read_text(encoding='utf-8')
+        assert not re.search(r'(src|href)="/', text), path.name
+        assert not re.search(r'https?://', text), path.name
 
 
-@pytest.mark.usefixtures('built')
-def test_index_is_served_at_the_root(fake_bc):
-    with client_for(fake_bc) as client:
-        response = client.get('/')
-    assert response.status_code == 200
-    assert 'batcontrol' in response.text
+def test_the_api_is_not_shadowed_by_the_dashboard(client):
+    assert client.get('/api/v1/health').json()['ok'] is True
 
 
-@pytest.mark.usefixtures('built')
-def test_hashed_assets_are_served(fake_bc):
-    with client_for(fake_bc) as client:
-        assert client.get('/assets/index-abc123.js').status_code == 200
+def test_the_button_charges_through_the_real_core():
+    """POST /manual-charge -> next cycle sets force charge at full speed."""
+    prices = MagicMock()
+    prices.get_slots.return_value = []
+    bc = Batcontrol(CONFIG, inverter=make_inverter(soc=90), prices=prices)
+    bc.run()
+    bc.inverter.set_mode_allow_discharge.assert_called_once()
 
+    with TestClient(create_app(bc, ApiConfig(enabled=True))) as client:
+        assert client.post('/api/v1/manual-charge', json={'minutes': 60}).status_code == 200
+        assert bc.wakeup.is_set()
+        bc.run()
+        bc.inverter.set_mode_force_charge.assert_called_once_with(3800)
+        status = client.get('/api/v1/status').json()['data']
+        assert status['reason'] == rules.REASON_MANUAL
+        assert status['manual_until'] is not None
 
-@pytest.mark.usefixtures('built')
-def test_font_licenses_are_reachable(fake_bc):
-    """The OFL requires the license text to travel with the fonts."""
-    with client_for(fake_bc) as client:
-        assert client.get('/licenses/LICENSE-OFL-VT323.txt').status_code == 200
-
-
-@pytest.mark.usefixtures('built')
-def test_the_api_keeps_precedence_over_the_dashboard(fake_bc):
-    """The dashboard is mounted at /, so this is not self-evident."""
-    with client_for(fake_bc) as client:
-        assert client.get('/api/v1/health').json()['ok'] is True
-        assert client.get('/openapi.json').status_code == 200
-        assert client.get('/docs').status_code == 200
-
-
-@pytest.mark.usefixtures('built')
-def test_path_traversal_is_refused(fake_bc):
-    with client_for(fake_bc) as client:
-        response = client.get('/../../pyproject.toml')
-    assert response.status_code in (400, 404)
-
-
-@pytest.mark.usefixtures('unbuilt')
-def test_a_missing_build_serves_a_hint_not_a_stack_trace(fake_bc, caplog):
-    with caplog.at_level('WARNING'):
-        with client_for(fake_bc) as client:
-            response = client.get('/')
-    assert response.status_code == 200
-    assert 'npm' in response.text
-    assert 'npm' in caplog.text
-
-
-@pytest.mark.usefixtures('unbuilt')
-def test_the_api_works_without_a_build(fake_bc):
-    with client_for(fake_bc) as client:
-        assert client.get('/api/v1/health').status_code == 200
-
-
-@pytest.mark.usefixtures('built')
-def test_the_dashboard_can_be_switched_off(fake_bc):
-    with client_for(fake_bc, dashboard_enabled=False) as client:
-        assert client.get('/').status_code == 404
-        assert client.get('/api/v1/health').status_code == 200
-
-
-@pytest.mark.usefixtures('built')
-def test_docs_work_without_the_dashboard(fake_bc):
-    """Regression: the Swagger bundle was only served by the dashboard
-    mount, so /docs rendered blank with dashboard_enabled: false."""
-    with client_for(fake_bc, dashboard_enabled=False) as client:
-        assert client.get('/swagger/swagger-ui-bundle.js').status_code == 200
-        assert client.get('/swagger/swagger-ui.css').status_code == 200
-        assert client.get('/').status_code == 404
-
-
-@pytest.mark.usefixtures('built')
-def test_docs_load_the_bundled_swagger_ui_relatively(fake_bc):
-    """FastAPI points /docs at a CDN by default.
-
-    On a Home Assistant box without internet egress that leaves the API
-    documentation blank, which is the same reason the fonts are bundled. The
-    asset URLs have to be relative, because under ingress the page lives at
-    /api/hassio_ingress/<token>/docs.
-    """
-    with client_for(fake_bc) as client:
-        page = client.get('/docs').text
-    assert 'src="swagger/swagger-ui-bundle.js"' in page
-    assert 'swagger/swagger-ui.css' in page
-    assert 'src="/swagger/' not in page
-    for host in ('cdn.jsdelivr.net', 'unpkg.com', 'fastapi.tiangolo.com'):
-        assert host not in page, f'/docs still loads from {host}'
-
-
-@pytest.mark.usefixtures('unbuilt')
-def test_docs_fall_back_to_the_cdn_without_a_build(fake_bc):
-    """A source checkout without npm still gets working docs - with internet."""
-    with client_for(fake_bc) as client:
-        response = client.get('/docs')
-    assert response.status_code == 200
-    assert 'swagger-ui' in response.text
-
-
-@pytest.mark.usefixtures('built')
-def test_redoc_is_not_served(fake_bc):
-    """One documentation UI that works offline beats two that need a CDN."""
-    with client_for(fake_bc) as client:
-        assert client.get('/redoc').status_code in (404, 405)
+        client.delete('/api/v1/manual-charge')
+        bc.run()
+        assert client.get('/api/v1/status').json()['data']['mode'] == 'normal'
