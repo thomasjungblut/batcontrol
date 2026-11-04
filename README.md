@@ -54,7 +54,7 @@ logged once at startup).
 ## Run
 
 ```bash
-docker compose up -d --build      # see compose.yaml: ./config and ./logs as volumes
+docker compose up -d              # config and logs in /share/Container/batcontrol, see below
 # or from source
 uv venv --python 3.14 && uv pip install -e '.[test]'
 python -m batcontrol --config config/batcontrol_config.yaml [--one-shot]
@@ -67,11 +67,15 @@ and `latest`; `NO_PUSH=1` builds only):
 scripts/build-and-push.sh
 ```
 
-The image is `python:3.14-slim` (Debian). On first start with an empty `./config` it
-copies a template config and exits; fill it in and start again. Set `TZ` in
-`compose.yaml` and make the published port match `api.port`. `docker stop` sends
-SIGTERM, batcontrol then restores the inverter settings it changed (from the backup
-files in `./config`) before it exits.
+The image is `python:3.14-slim` (Debian). `config/` and `logs/` live in a fixed host folder,
+`/share/Container/batcontrol`, so recreating the container keeps the config. Create the
+folder once; set `BATCONTROL_DIR` to use another one
+(`BATCONTROL_DIR=. docker compose up -d --build` for a local checkout).
+
+On first start with an empty `config/` it copies a template config and exits; fill it in
+and start again. Set `TZ` in `compose.yaml` and make the published port match `api.port`.
+`docker stop` sends SIGTERM, batcontrol then restores the inverter settings it changed
+(from the backup files in `config/`) before it exits.
 
 The dashboard is at `http://<host>:<api.port>/`. It is plain HTML/CSS/JS in
 `src/batcontrol/web/static/`, with no build step.

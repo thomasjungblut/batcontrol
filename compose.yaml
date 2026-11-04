@@ -1,12 +1,16 @@
 services:
   batcontrol:
+    image: 192.168.178.63:32768/batcontrol:latest
     build: .
-    image: batcontrol:local
     environment:
       - TZ=Europe/Berlin
     volumes:
-      - ./config:/app/config
-      - ./logs:/app/logs
+      # A fixed host folder, not ./config, so recreating the container never
+      # loses batcontrol_config.yaml or the inverter backup restored on
+      # shutdown. Override with BATCONTROL_DIR (BATCONTROL_DIR=. for a local
+      # checkout).
+      - ${BATCONTROL_DIR:-/share/Container/batcontrol}/config:/app/config
+      - ${BATCONTROL_DIR:-/share/Container/batcontrol}/logs:/app/logs
     # Must match api.port in the config.
     ports:
       - "8080:8080"
