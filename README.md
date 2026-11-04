@@ -5,6 +5,8 @@ a **Fronius GEN24** with battery (Solar API), **Tibber** 15-minute prices, about
 consumption a day and a 10 kWh battery. No solar or consumption forecasts: fog makes
 them wrong too often.
 
+![The dashboard on a grey day: topping up at noon for the evening peak](ui_screenshot.png)
+
 ## The rules
 
 The house always takes solar first, then the battery, then the grid. batcontrol only
