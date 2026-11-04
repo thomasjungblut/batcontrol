@@ -56,7 +56,8 @@ class PlanModel(BaseModel):
     night_end: int = Field(description='End of the night window (08:00), epoch ms.')
     preview: bool = Field(
         description='True during the day: the coming night computed with '
-                    "today's battery level, not executed yet.")
+                    "today's battery level. Its night charges are not executed "
+                    'yet; the 12:00-16:00 top-up and negative slots are.')
     reserve_wh: float = Field(description='Reserve line at now (or 16:00), Wh.')
     deficit_wh: float = Field(description='Reserve minus usable energy, Wh.')
     saving_eur: float = Field(

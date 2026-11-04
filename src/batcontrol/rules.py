@@ -15,6 +15,15 @@ There are exactly three reasons to charge the battery from the grid:
                      expensive hour still to come before 08:00. If no slot is
                      cheap enough, there is nothing to save and nothing is
                      bought: running out then costs the same.
+                     Day top-up: during the day the evening cannot be
+                     covered by night slots, so if the battery is below the
+                     16:00 line, the gap is bought in the cheapest slots
+                     between 12:00 and 16:00 that are at least
+                     `min_price_difference` cheaper than the most expensive
+                     hour still to come before 08:00 (the evening peak). By
+                     noon the morning sun has had its chance; every cycle
+                     re-measures the gap, so solar that comes in shrinks it.
+                     The night plan only buys what the day did not.
 3. Manual:           the dashboard button, full speed for a fixed time.
 
 Outside of a charge the battery runs normally (house first, then battery,
@@ -35,6 +44,8 @@ SLOT = datetime.timedelta(minutes=SLOT_MINUTES)
 # The night the battery has to bridge, local time.
 NIGHT_START_HOUR = 16
 SOLAR_START_HOUR = 8
+# Day top-up: the 16:00 gap may be bought from this hour on.
+DAY_TOPUP_HOUR = 12
 # Reserve line: energy needed at midnight and the night time draw.
 MIDNIGHT_RESERVE_WH = 4000.0
 NIGHT_LOAD_W = 300.0
@@ -293,17 +304,22 @@ def plan_negative(slots: Sequence[Slot], battery: Battery,
 
 
 def plan_reserve(night: Sequence[Slot], deficit: float,  # pylint: disable=too-many-locals
-                 settings: Settings) -> Tuple[List[Charge], Optional[str]]:
+                 settings: Settings, *, buy_before: Optional[datetime.datetime] = None
+                 ) -> Tuple[List[Charge], Optional[str]]:
     """ Buy `deficit` Wh in the cheapest night slots worth it.
 
     A slot is worth it when it is at least min_price_difference cheaper than
-    the most expensive hour after it, before 08:00. Returns the charges and,
-    if the deficit could not be covered, a note why.
+    the most expensive hour after it, before 08:00. With `buy_before`, only
+    slots starting before it are bought (the day top-up); the later slots
+    still count as the hour to compare against. Returns the charges and, if
+    the deficit could not be covered, a note why.
     """
     candidates = []
     for index, slot in enumerate(night):
         if slot.price < 0:
             continue  # already a negative price charge
+        if buy_before is not None and slot.start >= buy_before:
+            break
         peak = _peak_after(night, index)
         if peak is None:
             continue
@@ -382,15 +398,24 @@ def plan(now: datetime.datetime,  # pylint: disable=too-many-arguments,too-many-
     deficit = min(deficit, battery.free_wh)
 
     night = [s for s in slots if s.end > ref and s.start < night_end]
-    negative_in_night = sum(c.energy_wh for c in negative
-                            if night_start <= c.start < night_end)
-    to_buy = max(0.0, deficit - negative_in_night)
+    # Negative slots still to come before 08:00 fill the gap for free, during
+    # the day as well as at night.
+    negative_ahead = sum(c.energy_wh for c in negative if c.start < night_end)
+    to_buy = max(0.0, deficit - negative_ahead)
 
     reserve_charges: List[Charge] = []
     if to_buy > 0 and (to_buy >= settings.min_recharge_wh or was_charging):
-        reserve_charges, note = plan_reserve(night, to_buy, settings)
-        if note:
-            notes.append(note)
+        if preview:
+            noon = night_start.replace(hour=DAY_TOPUP_HOUR)
+            day = [s for s in slots if noon <= s.start < night_start]
+            reserve_charges, _ = plan_reserve(day + night, to_buy, settings,
+                                              buy_before=night_start)
+            to_buy -= sum(c.energy_wh for c in reserve_charges)
+        if to_buy > 1e-6:
+            night_charges, note = plan_reserve(night, to_buy, settings)
+            reserve_charges += night_charges
+            if note:
+                notes.append(note)
     elif to_buy > 0:
         notes.append(f'Reserve short by {to_buy:.0f} Wh, below the '
                      f'{settings.min_recharge_wh:.0f} Wh minimum recharge.')
@@ -399,8 +424,8 @@ def plan(now: datetime.datetime,  # pylint: disable=too-many-arguments,too-many-
 
     charges = tuple(sorted(negative + reserve_charges, key=lambda c: c.start))
 
-    # In a preview the reserve charges all start at 16:00 or later, so only
-    # a negative price slot can be the current one during the day.
+    # During the day the current charge is a negative price slot or a day
+    # top-up; the night charges of a preview start at 16:00 or later.
     current = next((c for c in charges if c.start <= now < c.end), None)
 
     if manual_until is not None and manual_until > now:

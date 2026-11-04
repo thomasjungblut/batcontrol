@@ -176,6 +176,16 @@ function renderPlan(s) {
   $('notes').replaceChildren(...plan.notes.map((n) => el('p', { class: 'dim small' }, `· ${n}`)))
 }
 
+// Round price levels (EUR/kWh) inside [lo, hi], at most four of them.
+function priceTicks(lo, hi) {
+  const step = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1].find((st) => (hi - lo) / st <= 4) || 1
+  const out = []
+  for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) {
+    out.push(Math.round(v * 100) / 100 + 0)  // + 0 turns -0 into 0
+  }
+  return out
+}
+
 function renderPrices(s) {
   const prices = s.prices
   const strip = $('strip')
@@ -189,15 +199,22 @@ function renderPrices(s) {
   const hi = Math.max(...values, lo + 0.01)
   // Scaled to the actual range so a 10 ct spread is visible.
   const floor = lo < 0 ? lo : lo - (hi - lo) * 0.4
-  strip.replaceChildren(...prices.map((p) => {
+  // Value -> height in percent of the plot area.
+  const pct = (v) => ((v - floor) / (hi - floor)) * 100
+  const bars = prices.map((p) => {
     const d = new Date(p.start)
     const cls = ['b', p.charge ? 'charge' : '', p.price < 0 ? 'neg' : ''].join(' ').trim()
-    const height = Math.max(4, ((p.price - floor) / (hi - floor)) * 100)
+    const height = Math.max(4, pct(p.price))
     const tick = d.getMinutes() === 0 && d.getHours() % 4 === 0
       ? el('span', { class: 'tick dim' }, clock(p.start).slice(0, 2)) : null
     return el('div', { class: 'slot', title: `${clock(p.start)}  ${ct(p.price)}${p.charge ? '  charge' : ''}` },
       el('div', { class: cls, style: { height: `${height}%` } }), tick)
-  }))
+  })
+  // Horizontal lines at round ct values, labelled on the left.
+  const lines = priceTicks(floor, hi).map((v) =>
+    el('div', { class: v === 0 ? 'gridline zero' : 'gridline', style: { bottom: `${pct(v)}%` } },
+      el('span', { class: 'ylabel dim' }, ct(v, 0))))
+  strip.replaceChildren(el('div', { class: 'grid' }, ...lines), ...bars)
   const min = prices.reduce((a, b) => (b.price < a.price ? b : a))
   const max = prices.reduce((a, b) => (b.price > a.price ? b : a))
   $('legend').replaceChildren(

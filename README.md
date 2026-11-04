@@ -20,6 +20,14 @@ decides when to **charge from the grid**. There are three reasons to do so:
    qualifies if it is at least `min_price_difference` (5 ct) cheaper than the most
    expensive hour still to come before 08:00. If no slot is cheap enough, nothing is
    bought, because running out would cost the same.
+
+   **Day top-up.** Energy bought at night cannot cover the evening. So if the battery is
+   below the 16:00 line during the day (a grey day), the gap is bought in the cheapest
+   slots **between 12:00 and 16:00** that are at least `min_price_difference` cheaper
+   than the most expensive hour still to come (usually the evening peak). By noon the
+   morning sun has had its chance, and every cycle re-measures the gap, so afternoon sun
+   shrinks it. Topping up only to the line leaves room for more solar. Whatever the day
+   could not buy is left to the night.
 3. **Manual.** The dashboard button charges at full speed for one hour.
 
 Everything is re-evaluated every 3 minutes. Shortfalls smaller than
@@ -31,7 +39,11 @@ replaces − charge price). For negative prices the comparison is the 24-hour me
 dashboard adds them up for the next 24 hours and multiplies by 30 for a rough monthly figure.
 
 During the day (08:00 to 16:00) the plan for the coming night is shown as a **preview**,
-computed with the current battery level. It is not acted on until 16:00.
+computed with the current battery level. Its night charges are not acted on until 16:00;
+the day top-up and negative slots are.
+
+The price chart has dashed lines at round ct values, labelled on the left (a solid red
+line marks 0 ct when prices go negative).
 
 ## Configuration
 

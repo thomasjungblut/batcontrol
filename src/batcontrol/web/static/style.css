@@ -179,7 +179,15 @@ body::after {
 .flows b { font-weight: 700; }
 #inverter-check { margin: 8px 0 0; }
 
-.strip { display: flex; align-items: flex-end; gap: 1px; height: 70px; padding-bottom: 14px; }
+.strip {
+  position: relative; display: flex; align-items: flex-end; gap: 1px;
+  height: 120px; padding: 0 0 14px 44px;
+}
+/* The grid covers the bar area only: above the hour ticks, right of the labels. */
+.grid { position: absolute; top: 0; right: 0; bottom: 14px; left: 44px; pointer-events: none; }
+.gridline { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--fg-dim); opacity: 0.6; z-index: 1; }
+.gridline.zero { border-top: 1px solid var(--red); }
+.ylabel { position: absolute; right: calc(100% + 6px); transform: translateY(-50%); font-size: 10px; white-space: nowrap; }
 .slot { position: relative; flex: 1 1 0; height: 100%; display: flex; align-items: flex-end; }
 .slot .b { width: 100%; background: var(--fg-faint); }
 .slot .b.charge { background: var(--amber); box-shadow: 0 0 6px rgba(255, 204, 51, 0.5); }

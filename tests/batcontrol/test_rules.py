@@ -150,12 +150,64 @@ def test_the_plan_never_exceeds_the_free_capacity():
     assert sum(c.energy_wh for c in plan.charges) <= 1600 + 1e-6
 
 
-def test_daytime_is_a_preview_and_never_charges_for_the_reserve():
-    plan = rules.plan(at(4, 12), slots(), battery(30), SETTINGS)
+def test_daytime_is_a_preview_and_tops_up_at_noon():
+    # 30 % = 2.5 kWh usable, the 16:00 line is 6.4 kWh: 3.9 kWh short.
+    plan = rules.plan(at(4, 10), slots(), battery(30), SETTINGS)
     assert plan.preview is True
-    assert plan.mode == rules.MODE_NORMAL
+    assert plan.mode == rules.MODE_NORMAL          # nothing before 12:00
     assert plan.reserve_wh == pytest.approx(6400)
+    (charge,) = plan.charges
+    assert charge.reason == rules.REASON_NIGHT_RESERVE
+    assert (charge.start, charge.end) == (at(4, 12), at(4, 13, 15))
+    assert charge.energy_wh == pytest.approx(3900)
+    assert charge.price == pytest.approx(0.23)
+    # Compared against the evening peak, which the night slots cannot cover.
+    assert (charge.compare_start, charge.compare_end) == (at(4, 18), at(4, 19))
+
+
+def test_the_day_top_up_charges_from_noon():
+    plan = rules.plan(at(4, 12, 5), slots(), battery(30), SETTINGS)
+    assert plan.mode == rules.MODE_CHARGE
+    assert plan.reason == rules.REASON_NIGHT_RESERVE
+    assert plan.charge_rate_w == 3800
+    assert 'until 13:15' in plan.headline
+
+
+def test_a_sunny_day_needs_no_top_up():
+    plan = rules.plan(at(4, 12, 5), slots(), battery(80), SETTINGS)
+    assert plan.mode == rules.MODE_NORMAL
+    assert plan.charges == ()
+
+
+def test_the_top_up_never_buys_before_noon():
+    cheap = {at(4, 11, 45): 0.05}
+    plan = rules.plan(at(4, 9), slots(overrides=cheap), battery(30), SETTINGS)
+    assert all(c.start >= at(4, 12) for c in plan.charges)
+
+
+def test_the_top_up_needs_the_price_difference_to_the_evening():
+    # Midday as expensive as the evening: wait for the night instead.
+    hourly = HOURLY[:12] + [0.33] * 4 + HOURLY[16:]
+    plan = rules.plan(at(4, 12, 5), slots(hourly=hourly), battery(30), SETTINGS)
+    assert plan.mode == rules.MODE_NORMAL
     assert plan.charges and all(c.start >= at(4, 16) for c in plan.charges)
+
+
+def test_the_night_only_buys_what_the_day_did_not():
+    # 10 %: 0.5 kWh usable, 5.9 kWh short. 12:00-16:00 is at least 9 ct
+    # below the 35 ct evening peak and holds 16 x 950 Wh: all of it is
+    # bought during the day, the night plan stays empty.
+    plan = rules.plan(at(4, 11), slots(), battery(10), SETTINGS)
+    assert sum(c.energy_wh for c in plan.charges) == pytest.approx(5900)
+    assert all(c.end <= at(4, 16) for c in plan.charges)
+    # With only 13:00-13:30 cheap enough, the rest goes to the night.
+    hourly = HOURLY[:12] + [0.33] * 4 + HOURLY[16:]
+    cheap = {at(4, 13): 0.20, at(4, 13, 15): 0.20}
+    plan = rules.plan(at(4, 11), slots(hourly=hourly, overrides=cheap), battery(10), SETTINGS)
+    day = [c for c in plan.charges if c.end <= at(4, 16)]
+    night = [c for c in plan.charges if c.start >= at(4, 16)]
+    assert sum(c.energy_wh for c in day) == pytest.approx(1900)
+    assert sum(c.energy_wh for c in night) == pytest.approx(4000)
 
 
 def test_missing_night_prices_are_reported():
