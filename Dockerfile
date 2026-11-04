@@ -48,7 +48,7 @@ RUN mkdir -p /app/config /app/logs
 VOLUME ["/app/config", "/app/logs"]
 
 # Dashboard and API, when api.enabled is set and api.host is 0.0.0.0.
-EXPOSE 8080
+EXPOSE 2187
 
 # exec in the entrypoint makes python PID 1, so SIGTERM from "docker stop"
 # reaches batcontrol and it restores the inverter settings before exiting.

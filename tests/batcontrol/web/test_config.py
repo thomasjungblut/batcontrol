@@ -9,7 +9,7 @@ def test_missing_block_disables_the_api():
     parsed = web_config.from_config({})
     assert parsed.enabled is False
     assert parsed.host == '127.0.0.1'
-    assert parsed.port == 8080
+    assert parsed.port == 2187
     assert parsed.auth_enabled is False
 
 
@@ -34,7 +34,7 @@ def test_home_assistant_string_values_are_accepted():
     assert parsed.docs_enabled is True
 
 
-@pytest.mark.parametrize('port', [0, -1, 65536, 'http', [8080]])
+@pytest.mark.parametrize('port', [0, -1, 65536, 'http', [2187]])
 def test_invalid_port_is_rejected(port):
     with pytest.raises(ValueError):
         web_config.from_config({'api': {'port': port}})
@@ -42,7 +42,7 @@ def test_invalid_port_is_rejected(port):
 
 def test_explicit_null_port_falls_back_to_the_default():
     """A commented-out HA option arrives as None, not as a missing key."""
-    assert web_config.from_config({'api': {'port': None}}).port == 8080
+    assert web_config.from_config({'api': {'port': None}}).port == 2187
 
 
 def test_invalid_boolean_is_rejected():
@@ -130,7 +130,7 @@ def test_a_bracketed_ipv6_host_is_bindable():
     {'enabled': False, 'host': ''},
     {'enabled': False, 'host': '   '},
     {'enabled': False, 'dashboard_enabled': ''},
-    {'enabled': '', 'port': 8080},
+    {'enabled': '', 'port': 2187},
     {'enabled': 'true', 'host': '', 'port': '', 'auth_token': ''},
 ])
 def test_an_empty_value_means_unset_not_invalid(block):
@@ -143,7 +143,7 @@ def test_an_empty_value_means_unset_not_invalid(block):
     """
     parsed = web_config.from_config({'api': block})
     assert parsed.host == '127.0.0.1'
-    assert parsed.port == 8080
+    assert parsed.port == 2187
 
 
 @pytest.mark.parametrize('block', [

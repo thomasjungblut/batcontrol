@@ -13,7 +13,7 @@ from ..value_utils import parse_bool_flag
 logger = logging.getLogger(__name__)
 
 DEFAULT_HOST = '127.0.0.1'
-DEFAULT_PORT = 8080
+DEFAULT_PORT = 2187
 
 # Path prefixes served by the application
 API_PREFIX = '/api/v1'
