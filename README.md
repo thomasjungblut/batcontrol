@@ -54,7 +54,7 @@ logged once at startup).
 ## Run
 
 ```bash
-docker compose up -d              # ./config and ./logs next to compose.yaml
+docker compose up -d              # config and logs in named volumes, see below
 # or from source
 uv venv --python 3.14 && uv pip install -e '.[test]'
 python -m batcontrol --config config/batcontrol_config.yaml [--one-shot]
@@ -67,12 +67,19 @@ and `latest`; `NO_PUSH=1` builds only):
 scripts/build-and-push.sh
 ```
 
-The image is `python:3.14-slim` (Debian). Keep the `volumes:` entries of `compose.yaml`:
-without them `config/` lives in an anonymous volume, and a recreated container starts
-over with the template config.
+The image is `python:3.14-slim` (Debian). `config/` and `logs/` are named Docker volumes,
+so recreating the container keeps them (only `docker compose down -v` deletes them).
+Edit the config by copying it out and back in:
+
+```bash
+docker compose cp batcontrol:/app/config/batcontrol_config.yaml .
+# edit it, then
+docker compose cp batcontrol_config.yaml batcontrol:/app/config/
+docker compose restart batcontrol
+```
 
 On first start with an empty `config/` it copies a template config and exits; fill it in
-and start again. Set `TZ` in `compose.yaml` and make the published port match `api.port`.
+(as above) and start again. Set `TZ` in `compose.yaml` and make the published port match `api.port`.
 `docker stop` sends SIGTERM, batcontrol then restores the inverter settings it changed
 (from the backup files in `config/`) before it exits.
 
